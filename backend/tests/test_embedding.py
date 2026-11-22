@@ -6,6 +6,7 @@ L2-normalized) — TIDAK memuat model sungguhan agar suite tetap cepat.
 """
 
 import math
+import threading
 import uuid
 from datetime import UTC, datetime
 from hashlib import md5
@@ -337,7 +338,10 @@ def test_text_embedder_mean_pool_and_l2_determinism(monkeypatch):
     different = embedder.encode(["perawat rumah sakit"])[0]
     assert cosine(first, different) < 0.5
 
-    # Semua chunk dari semua teks dikirim dalam SATU batch.
+    # Semua chunk dari semua teks dikirim dalam SATU batch. Cache encode di-reset
+    # dulu agar teks yang sudah pernah di-encode di atas tidak dilayani dari cache
+    # (perilaku cache diperiksa test tersendiri di bawah).
+    embedder_module.reset_encode_cache()
     embedder.encode(["alpha\n\nbeta", "gamma delta"])
     assert fake_model.batches[-1] == ["alpha", "beta", "gamma delta"]
 
@@ -626,3 +630,200 @@ def test_reembed_all_respects_guard_and_force_bypass(db_session, monkeypatch):
     assert len(db_session.scalars(select(CvEmbedding)).all()) == 1
     assert len(db_session.scalars(select(JobEmbedding)).all()) == 1
     assert cv.id and job.id  # pemakaian variabel agar jelas baris ini miliknya
+
+
+# --- Idempotensi upsert di bawah penulis konkuren (incident 21 Nov 2026) ---
+
+
+def _plain_session(engine) -> Session:
+    """Session biasa di atas engine test (helper seed data modul ini)."""
+    return Session(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def test_upsert_overwrites_row_committed_by_concurrent_session(db_engine, monkeypatch):
+    """Baris yang dibuat session lain (request konkuren yang menang balapan)
+    TIDAK boleh memicu UniqueViolation — upsert harus menimpanya dengan aman."""
+    monkeypatch.setattr(embedding_service, "get_embedder", _fake_factory)
+    db = _plain_session(db_engine)
+    hr = _seed_user(db, "hr-upsert-race@example.dev", role="hr")
+    company = _seed_company(db, hr)
+    job = _seed_job(db, hr, company, status="active")
+    settings = _svc_settings()
+
+    # Session "penulis lain": buat embedding lalu commit (menang balapan).
+    other_factory = sessionmaker(bind=db_engine, autoflush=False, expire_on_commit=False)
+    with other_factory() as other:
+        embedding_service.embed_job(other, job.id, settings)
+    committed_row_id = other_factory().scalars(select(JobEmbedding)).all()[0].id
+
+    # Session request (beda session) upsert kunci yang sama → tanpa error.
+    with other_factory() as request_session:
+        embedding_service.embed_job(request_session, job.id, settings)
+        rows = request_session.scalars(select(JobEmbedding)).all()
+        assert len(rows) == 1  # TIDAK duplikat
+        assert rows[0].id == committed_row_id  # baris existing diperbarui, bukan baru
+
+    # Ulangi berkali-kali (re-embed berulang) → tetap satu baris, id stabil.
+    with other_factory() as request_session:
+        for _ in range(3):
+            embedding_service.embed_job(request_session, job.id, settings)
+        rows = request_session.scalars(select(JobEmbedding)).all()
+        assert len(rows) == 1
+        assert rows[0].id == committed_row_id
+
+
+def test_upsert_concurrent_threads_single_row(db_engine, monkeypatch):
+    """Dua thread session terpisah men-embed job yang SAMA bersamaan → tanpa
+    exception yang lolos dan tepat satu baris embedding (bukan UniqueViolation).
+
+    Meniru kondisi nyata incident 21 Nov 2026: endpoint rekomendasi dan hook
+    publish men-embed lowongan yang sama dalam waktu bersamaan."""
+    monkeypatch.setattr(embedding_service, "get_embedder", _fake_factory)
+    db = _plain_session(db_engine)
+    hr = _seed_user(db, "hr-upsert-threads@example.dev", role="hr")
+    company = _seed_company(db, hr)
+    job = _seed_job(db, hr, company, status="active")
+    settings = _svc_settings()
+
+    factory = sessionmaker(bind=db_engine, autoflush=False, expire_on_commit=False)
+    errors: list[Exception] = []
+
+    def worker() -> None:
+        try:
+            with factory() as thread_db:
+                embedding_service.embed_job(thread_db, job.id, settings)
+        except Exception as exc:  # noqa: BLE001 — diteruskan ke assertion utama
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert errors == []
+    assert len(db.scalars(select(JobEmbedding)).all()) == 1
+
+
+# --- Cache hasil encode per proses (optimasi title encoding 22-23 dtk CPU) ---
+
+
+def _counting_fake_model(batches_log: list | None = None):
+    """Palsu SentenceTransformer + pencatat batch (mirip FakeChunkModel)."""
+    log = batches_log if batches_log is not None else []
+
+    class _Model:
+        batches = log
+
+        def encode(self, sentences, **kwargs):
+            log.append(list(sentences))
+            rows = []
+            for sentence in sentences:
+                vec = [0.0] * DIM
+                for token in sentence.lower().split():
+                    for i, weight in enumerate(_token_vector(token)):
+                        vec[i] += weight
+                rows.append(vec)
+            import numpy as np
+
+            return np.asarray(rows, dtype=float)
+
+    return _Model()
+
+
+def test_encode_cache_hit_skips_model(monkeypatch):
+    """Teks yang sudah pernah di-encode dilayani cache: model TIDAK disentuh pada
+    panggilan kedua, hasil identik, dan model bahkan tidak dimuat untuk input
+    yang seluruhnya ter-cache."""
+    embedder = TextEmbedder(MODEL_NAME)
+    batches: list = []
+    monkeypatch.setattr(embedder, "_load_model", lambda: _counting_fake_model(batches))
+
+    first = embedder.encode(["alpha beta", "gamma delta"])
+    assert len(batches) == 1  # satu batch berisi seluruh chunk
+
+    second = embedder.encode(["alpha beta", "gamma delta"])
+    assert len(batches) == 1  # TIDAK ada encode baru
+    assert second == first
+    # Salinan segar: memutasi hasil tidak meracuni cache.
+    second[0][0] = 999.0
+    third = embedder.encode(["alpha beta"])
+    assert third[0][0] == first[0][0]
+
+    # Input yang seluruhnya ter-cache: model tidak perlu dimuat sama sekali.
+    embedder._model = None  # noqa: SLF001 — uji perilaku lazy-load
+    loaded = []
+    monkeypatch.setattr(
+        embedder, "_load_model", lambda: loaded.append(1) or _counting_fake_model(batches)
+    )
+    warm = embedder.encode(["alpha beta"])
+    assert loaded == []  # tanpa pemuatan model
+    assert warm[0] == first[0]
+
+
+def test_encode_cache_dedup_within_batch(monkeypatch):
+    """Duplikat dalam SATU panggilan encode hanya dikirim ke model sekali — kedua
+    hasil tetap identik dan sejajar urutan input."""
+    embedder = TextEmbedder(MODEL_NAME)
+    batches: list = []
+    monkeypatch.setattr(embedder, "_load_model", lambda: _counting_fake_model(batches))
+
+    results = embedder.encode(["alpha beta", "gamma delta", "alpha beta"])
+    assert results[0] == results[2]  # duplikat → vektor identik
+    assert results[1] != results[0]
+    # chunk "alpha beta" (1 chunk) + "gamma delta" (1 chunk) — tanpa pengulangan
+    assert batches[-1] == ["alpha beta", "gamma delta"]
+
+
+def test_encode_cache_isolated_per_model(monkeypatch):
+    """Kunci cache memuat model_name: teks sama pada model berbeda → vektor
+    berbeda (tidak ada kebocoran lintas model)."""
+    embedder_a = TextEmbedder("model-a")
+    embedder_b = TextEmbedder("model-b")
+
+    class OffsetModel:
+        def encode(self, sentences, **kwargs):
+            import numpy as np
+
+            rows = []
+            for sentence in sentences:
+                base = [0.0] * DIM
+                for i, weight in enumerate(_token_vector(sentence)):
+                    base[i] += weight
+                base[0] += 1.0  # penanda model B
+                rows.append(base)
+            return np.asarray(rows, dtype=float)
+
+    monkeypatch.setattr(embedder_a, "_load_model", lambda: _counting_fake_model())
+    monkeypatch.setattr(embedder_b, "_load_model", lambda: OffsetModel())
+
+    vec_a = embedder_a.encode(["alpha beta"])[0]
+    vec_b = embedder_b.encode(["alpha beta"])[0]
+    assert vec_a != vec_b
+    assert vec_a[0] != vec_b[0]  # offset model B terlihat
+
+
+def test_encode_cache_bounded_eviction(monkeypatch):
+    """Cache LRU terbatas: melebihi batas → entri paling lama dibuang, hasil
+    tetap benar (entri terbuang di-encode ulang tanpa error)."""
+    embedder = TextEmbedder(MODEL_NAME)
+    batches: list = []
+    monkeypatch.setattr(embedder, "_load_model", lambda: _counting_fake_model(batches))
+    monkeypatch.setattr(embedder_module, "_ENCODE_CACHE_MAX", 3)
+
+    texts = [f"teks-{i}" for i in range(4)]
+    first = embedder.encode(texts)
+    assert len(embedder_module._ENCODE_CACHE) == 3  # teks-0 terbuang (LRU)
+    again = embedder.encode(texts)
+    assert again == first  # hasil identik walau sebagian di-encode ulang
+    assert len(batches) == 2  # batch pertama (4 chunk) + batch kedua (teks-0 saja)
+
+
+def test_encode_cache_list_independence(monkeypatch):
+    """Setiap posisi hasil adalah list INDEPENDEN — duplikat dalam batch tidak
+    pernah berbagi objek list (mutasi satu tidak mengubah yang lain)."""
+    embedder = TextEmbedder(MODEL_NAME)
+    monkeypatch.setattr(embedder, "_load_model", lambda: _counting_fake_model())
+    results = embedder.encode(["alpha beta", "alpha beta"])
+    assert results[0] == results[1]
+    results[0].append(123.0)
+    assert len(results[1]) == DIM  # tidak terpengaruh

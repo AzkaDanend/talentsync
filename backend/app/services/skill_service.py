@@ -65,10 +65,14 @@ _NO_MATCH: dict = {
 def _normalize_with_index(db: Session, raw: str, index: dict) -> dict:
     """normalize_skill dengan penjagaan taksonomi kosong: indeks alias tanpa
     entri berarti tidak mungkin ada padanan — kembalikan hasil 'none' tanpa
-    memanggil normalize_skill (asumsinya taksonomi sudah di-seed)."""
+    memanggil normalize_skill (asumsinya taksonomi sudah di-seed).
+
+    Indeks yang dimuat pemanggil DITERUSKAN ke normalize_skill — dulu fungsi
+    ini mengabaikan index dan memicu query indeks BARU per nama skill
+    (ratusan query per request rekomendasi; incident 21 Nov 2026)."""
     if not index:
         return dict(_NO_MATCH)
-    return taxonomy_service.normalize_skill(db, raw)
+    return taxonomy_service.normalize_skill(db, raw, index=index)
 
 
 def _build_scan_regex(
@@ -437,17 +441,25 @@ def delete_my_skill(db: Session, user: User, skill_id: uuid.UUID) -> None:
 # --- Skill lowongan (dipasang di job_service) ---
 
 
-def normalize_job_skills(db: Session, skills: list[dict]) -> list[dict]:
+def normalize_job_skills(
+    db: Session, skills: list[dict], *, index: dict | None = None
+) -> list[dict]:
     """Normalisasi skill lowongan {name, required} -> baris job_skills.
 
     Dedupe per slug kanon dengan precedence REQUIRED (mirror schemas/job.py);
     nama tanpa padanan didedupe per raw_name (case-insensitive), tetap ada di
     hasil dengan canonical_skill_id None (tidak persistable — FK NOT NULL).
+
+    `index` opsional: peta alias milik pemanggil yang sudah dimuat (jalur
+    rekomendasi memanggil ini per lowongan — tanpa penerusan, cache proses
+    yang mengembalikan dict sama tetap aman; parameter ini eksplisit agar
+    pemanggil batch tidak memicu query per lowongan).
     """
     result: list[dict] = []
     by_slug: dict[str, dict] = {}
     by_raw: dict[str, dict] = {}
-    index = taxonomy_service.load_alias_index(db)
+    if index is None:
+        index = taxonomy_service.load_alias_index(db)
     for skill in skills or []:
         name = str(skill.get("name") or "").strip()
         if not name:
@@ -485,6 +497,49 @@ def normalize_job_skills(db: Session, skills: list[dict]) -> list[dict]:
             by_raw[key] = item
             result.append(item)
     return result
+
+
+def resolve_normalized_skills(
+    normalized: list[dict], canon_by_id: dict[uuid.UUID, CanonicalSkill]
+) -> list[dict]:
+    """Baris `normalize_job_skills` + peta kanon -> bentuk kontrak matching.
+
+    [{"name": raw, "slug"|None, "display", "required"}] — mirror mapping di
+    match_service._resolve_job_skills; diekstrak agar jalur batch (rekomendasi)
+    dan jalur tunggal (compatibility) memakai pemetaan yang PERSIS sama.
+    """
+    resolved: list[dict] = []
+    for item in normalized:
+        canon = canon_by_id.get(item["canonical_skill_id"]) if item["canonical_skill_id"] else None
+        resolved.append(
+            {
+                "name": item["raw_name"],
+                "slug": canon.slug if canon is not None else None,
+                "display": canon.name if canon is not None else item["raw_name"],
+                "required": bool(item["required"]),
+            }
+        )
+    return resolved
+
+
+def canonical_map_for_normalized(
+    db: Session, normalized_by_key: dict[object, list[dict]]
+) -> dict[uuid.UUID, CanonicalSkill]:
+    """Peta id skill kanon -> objeknya untuk SEKUMPUNIAN hasil normalize_job_skills.
+
+    Satu query untuk seluruh batch (anti N+1 pada jalur rekomendasi: dulu satu
+    query per lowongan). Kunci dict bebas (mis. job_id) — hanya nilai yang
+    digunakan."""
+    ids = {
+        item["canonical_skill_id"]
+        for items in normalized_by_key.values()
+        for item in items
+        if item["canonical_skill_id"]
+    }
+    if not ids:
+        return {}
+    canons = db.scalars(select(CanonicalSkill).where(CanonicalSkill.id.in_(ids)))
+    return {canon.id: canon for canon in canons}
 
 
 # --- Serialisasi respons (dipakai endpoint cvs.py & profiles.py) ---

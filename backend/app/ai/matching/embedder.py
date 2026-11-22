@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import threading
+from collections import OrderedDict
 
 # Panjang chunk maksimum (karakter). MiniLM-L12 menerima 512 token (~≈500
 # karakter teks Indonesia); 480 memberi margin aman untuk word-boundary wrap.
@@ -200,7 +201,15 @@ def build_job_text(
 class TextEmbedder:
     """Pembungkus SentenceTransformer: encode teks → chunk → batch → mean pool
     → L2-normalize. Model dimuat malas pada `encode` pertama (sekali per
-    instance; instance-nya sendiri disingleton oleh `get_embedder`)."""
+    instance; instance-nya sendiri disingleton oleh `get_embedder`).
+
+    Cache encode per proses (LRU, kunci (model_name, teks)): recommend_jobs
+    meng-encode ulang SEMUA judul lowongan + judul pengalaman CV pada setiap
+    permintaan (incident benchmark 21 Nov 2026: 22-23 dtk CPU per request
+    untuk 849 judul) padahal judul jarang berubah dan encode deterministik —
+    teks sama → vektor sama. Cache memangkas seluruh biaya encode untuk teks
+    yang sudah pernah di-encode dan mendedup duplikat di dalam satu batch.
+    Kunci memuat model_name sehingga pergantian model otomatis aman."""
 
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -218,42 +227,82 @@ class TextEmbedder:
     def encode(self, texts: list[str]) -> list[list[float]]:
         """Encode daftar teks → daftar vektor L2-normalized (dim model).
 
-        Seluruh chunk dari semua teks di-encode dalam satu panggilan batch,
-        lalu vektor chunk tiap teks dirata-rata (mean pooling) dan dinormalkan.
+        Urutan hasil selalu sejajar urutan input. Teks yang sudah ada di cache
+        (atau duplikat di dalam batch yang sama) tidak dikirim ke model — hasil
+        identik karena encode deterministik per teks (chunking konstan). Saat
+        SEMUA teks ter-cache, model tidak pernah dimuat/m disentuh.
         """
         if not texts:
             return []
-        model = self._model if self._model is not None else self._load_model()
 
-        all_chunks: list[str] = []
-        spans: list[tuple[int, int]] = []
-        for text in texts:
-            start = len(all_chunks)
-            all_chunks.extend(chunk_text(text))
-            spans.append((start, len(all_chunks)))
+        results: list[list[float] | None] = [None] * len(texts)
+        pending: dict[str, None] = {}  # teks unik yang perlu di-encode (urut kemunculan)
+        for position, text in enumerate(texts):
+            cache_key = (self.model_name, text)
+            cached = _ENCODE_CACHE.get(cache_key)
+            if cached is not None:
+                _ENCODE_CACHE.move_to_end(cache_key)
+                results[position] = list(cached)  # salinan: pemanggil bebas memutasi
+            elif text not in pending:
+                pending[text] = None
 
-        # Impor numpy dijalankan malas (ikut terpakai saat model dipakai).
-        import numpy as np
+        if pending:
+            model = self._model if self._model is not None else self._load_model()
 
-        matrix = np.asarray(
-            model.encode(
-                all_chunks,
-                batch_size=ENCODE_BATCH_SIZE,
-                convert_to_numpy=True,
-                normalize_embeddings=False,
-                show_progress_bar=False,
-            ),
-            dtype=float,
-        )
+            all_chunks: list[str] = []
+            spans: list[tuple[int, int]] = []
+            span_texts: list[str] = []
+            for text in pending:
+                start = len(all_chunks)
+                all_chunks.extend(chunk_text(text))
+                spans.append((start, len(all_chunks)))
+                span_texts.append(text)
 
-        vectors: list[list[float]] = []
-        for start, end in spans:
-            mean = matrix[start:end].mean(axis=0)
-            norm = float(np.linalg.norm(mean))
-            if norm > 0.0:
-                mean = mean / norm
-            vectors.append([float(value) for value in mean])
-        return vectors
+            # Impor numpy dijalankan malas (ikut terpakai saat model dipakai).
+            import numpy as np
+
+            matrix = np.asarray(
+                model.encode(
+                    all_chunks,
+                    batch_size=ENCODE_BATCH_SIZE,
+                    convert_to_numpy=True,
+                    normalize_embeddings=False,
+                    show_progress_bar=False,
+                ),
+                dtype=float,
+            )
+
+            computed: dict[str, list[float]] = {}
+            for text, (start, end) in zip(span_texts, spans, strict=True):
+                mean = matrix[start:end].mean(axis=0)
+                norm = float(np.linalg.norm(mean))
+                if norm > 0.0:
+                    mean = mean / norm
+                vector = [float(value) for value in mean]
+                computed[text] = vector
+                cache_key = (self.model_name, text)
+                _ENCODE_CACHE[cache_key] = vector
+                while len(_ENCODE_CACHE) > _ENCODE_CACHE_MAX:
+                    _ENCODE_CACHE.popitem(last=False)  # LRU: buang paling lama tak dipakai
+
+            # Pass pengisian akhir: occurrence pertama MAUPUN duplikat dalam batch
+            # masing-masing dapat salinan segar (tidak pernah berbagi list).
+            for position, text in enumerate(texts):
+                if results[position] is None:
+                    results[position] = list(computed[text])
+
+        return results  # type: ignore[return-value] — semua posisi terisi di atas
+
+
+# Cache hasil encode per proses: kunci (model_name, teks), nilai vektor 384 dim.
+# LRU terbatas agar memori terkendali (~9 KB/entri → 4096 ≈ ±40 MB kasus terburuk).
+_ENCODE_CACHE: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
+_ENCODE_CACHE_MAX = 4096
+
+
+def reset_encode_cache() -> None:
+    """Kosongkan cache hasil encode (test & CLI/scripts; produksi tidak perlu)."""
+    _ENCODE_CACHE.clear()
 
 
 # Singleton malas per model_name: hook confirm/publish dan skrip re-embed dalam

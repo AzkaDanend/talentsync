@@ -4,6 +4,11 @@ import { deleteCv, downloadCv, fetchCvs, setPrimaryCv, uploadCv, type CVDoc } fr
 import { cvStatusLabels, formatDateTime, formatFileSize } from "../../lib/format";
 import { Alert, Badge, Button, Card, EmptyState, Spinner } from "../../components/ui";
 
+// Interval polling status CV: 2 dtk (dulu 800 ms — terlalu agresif bagi backend).
+const POLL_INTERVAL_MS = 2_000;
+// Batas total polling: CV macet tidak dipolling tanpa henti (maks 2 menit).
+const POLL_MAX_MS = 120_000;
+
 export default function MyCvPage() {
   const [cvs, setCvs] = useState<CVDoc[] | null>(null);
   const [message, setMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
@@ -27,26 +32,52 @@ export default function MyCvPage() {
 
   // Polling ringan selama ada CV yang masih diproses — termasuk ekstraksi M1
   // (extraction_status "pending"), agar chip status & tautan review muncul sendiri.
+  // Aturan (incident 21 Nov 2026):
+  // - interval 2 dtk (dulu 800 ms — membanjiri backend);
+  // - loop berhenti saat komponen unmount (flag cancelled — dulu request in-flight
+  //   masih menjadwalkan timer baru setelah cleanup);
+  // - ada batas waktu 2 menit: CV yang macet tidak dipolling tanpa henti;
+  //   pengguna diberi pesan untuk memuat ulang manual.
   const pollTimer = useRef<number | undefined>(undefined);
+  const pollMounted = useRef(false);
+  const pollDeadline = useRef(0);
+
+  function resetPollDeadline() {
+    pollDeadline.current = Date.now() + POLL_MAX_MS;
+  }
 
   function schedulePoll(current: CVDoc[]) {
     window.clearTimeout(pollTimer.current);
-    if (isBusy(current)) {
-      pollTimer.current = window.setTimeout(poll, 800);
+    if (!pollMounted.current) return; // unmount — jangan jadwalkan loop baru
+    if (!isBusy(current)) return; // selesai — polling berhenti
+    if (Date.now() > pollDeadline.current) {
+      setMessage({
+        kind: "error",
+        text: "Status CV belum berubah setelah beberapa waktu. Muat ulang halaman untuk memeriksa lagi.",
+      });
+      return;
     }
+    pollTimer.current = window.setTimeout(() => void poll(), POLL_INTERVAL_MS);
   }
 
   async function poll(): Promise<void> {
     try {
       schedulePoll(await refresh());
     } catch (err) {
+      if (!pollMounted.current) return;
       setMessage({ kind: "error", text: err instanceof Error ? err.message : "Gagal memuat." });
     }
   }
 
   useEffect(() => {
-    poll();
-    return () => window.clearTimeout(pollTimer.current);
+    pollMounted.current = true;
+    resetPollDeadline();
+    void poll();
+    return () => {
+      pollMounted.current = false;
+      window.clearTimeout(pollTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function handleUpload() {
@@ -60,6 +91,7 @@ export default function MyCvPage() {
     try {
       await uploadCv(file);
       if (fileRef.current) fileRef.current.value = "";
+      resetPollDeadline(); // CV baru diproses — perpanjang jendela polling
       await poll();
       setMessage({
         kind: "success",

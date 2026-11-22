@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { fetchPublicJobs, type Job, type Page } from "../../lib/api";
 import { employmentTypeLabels, formatDate, formatSalary, workModeLabels } from "../../lib/format";
 import { Badge, Button, Card, EmptyState, Input, Pagination, Select, Spinner } from "../../components/ui";
@@ -54,27 +54,69 @@ export function JobCard({ job }: { job: Job }) {
 }
 
 export default function JobDiscovery() {
-  // Input teks di-debounce; filter select langsung.
-  const [qInput, setQInput] = useState("");
-  const [locInput, setLocInput] = useState("");
-  const [q, setQ] = useState("");
-  const [location, setLocation] = useState("");
-  const [employmentType, setEmploymentType] = useState("");
-  const [workMode, setWorkMode] = useState("");
-  const [page, setPage] = useState(1);
+  // Filter hidup di URL (?q=&location=&type=&mode=&page=) — navigasi pulang dari
+  // detail lowongan / rekomendasi memulihkan hasil pencarian seperti semula
+  // (incident 21 Nov 2026: navigasi job search "tidak mulus", state hilang).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [qInput, setQInput] = useState(searchParams.get("q") ?? "");
+  const [locInput, setLocInput] = useState(searchParams.get("location") ?? "");
+  const [q, setQ] = useState(searchParams.get("q") ?? "");
+  const [location, setLocation] = useState(searchParams.get("location") ?? "");
+  const [employmentType, setEmploymentType] = useState(searchParams.get("type") ?? "");
+  const [workMode, setWorkMode] = useState(searchParams.get("mode") ?? "");
+  const [page, setPage] = useState(Number(searchParams.get("page") ?? "1") || 1);
   const [result, setResult] = useState<Page<Job> | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Guard race: respons dari request lama tidak boleh menimpa hasil request terbaru.
   const seqRef = useRef(0);
 
+  // Tulis filter ke URL (replace — tidak menambah entri history per ketikan).
+  // Via ref agar identitas stabil: setSearchParams berubah identitas setiap URL
+  // berubah (react-router v7 deps [navigate, searchParams]) — tanpa ref, efek
+  // debounce ikut berjalan ulang setiap navigasi dan MENIMPA page kembali ke 1
+  // (terverifikasi di smoke test: klik halaman 2 ditimpa ±350 ms kemudian).
+  const syncUrlRef = useRef<(next: {
+    q: string;
+    location: string;
+    type: string;
+    mode: string;
+    page: number;
+  }) => void>(() => {});
+  syncUrlRef.current = (next: { q: string; location: string; type: string; mode: string; page: number }) => {
+    const params = new URLSearchParams();
+    if (next.q) params.set("q", next.q);
+    if (next.location) params.set("location", next.location);
+    if (next.type) params.set("type", next.type);
+    if (next.mode) params.set("mode", next.mode);
+    if (next.page > 1) params.set("page", String(next.page));
+    setSearchParams(params, { replace: true });
+  };
+
+  // Mirror filter select agar timer debounce selalu menulis nilai TERKINI
+  // (skenario: ketik → ubah select <350 ms → timer jalan dengan nilai basi).
+  const filtersRef = useRef({ employmentType, workMode });
+  filtersRef.current = { employmentType, workMode };
+
   useEffect(() => {
+    // Efek ini HANYA untuk input teks (debounce): reset halaman + tulis URL.
+    // Deps tidak memuat setSearchParams agar perubahan URL dari
+    // select/pagination tidak memicu penulisan ulang yang menimpa state.
     const timer = setTimeout(() => {
       setQ(qInput);
       setLocation(locInput);
       setPage(1);
+      syncUrlRef.current({
+        q: qInput,
+        location: locInput,
+        type: filtersRef.current.employmentType,
+        mode: filtersRef.current.workMode,
+        page: 1,
+      });
     }, 350);
     return () => clearTimeout(timer);
+    // employmentType/workMode dibaca dari state terkini lewat ref di atas.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [qInput, locInput]);
 
   const load = useCallback(async () => {
@@ -130,6 +172,7 @@ export default function JobDiscovery() {
           onChange={(e) => {
             setEmploymentType(e.target.value);
             setPage(1);
+            syncUrlRef.current({ q, location, type: e.target.value, mode: workMode, page: 1 });
           }}
         >
           <option value="">Semua Tipe</option>
@@ -144,6 +187,7 @@ export default function JobDiscovery() {
           onChange={(e) => {
             setWorkMode(e.target.value);
             setPage(1);
+            syncUrlRef.current({ q, location, type: employmentType, mode: e.target.value, page: 1 });
           }}
         >
           <option value="">Semua Mode</option>
@@ -167,7 +211,14 @@ export default function JobDiscovery() {
               <JobCard key={job.id} job={job} />
             ))}
           </div>
-          <Pagination page={result.page} pages={result.pages} onChange={setPage} />
+          <Pagination
+            page={result.page}
+            pages={result.pages}
+            onChange={(next) => {
+              setPage(next);
+              syncUrlRef.current({ q, location, type: employmentType, mode: workMode, page: next });
+            }}
+          />
         </>
       ) : (
         <EmptyState

@@ -51,6 +51,31 @@ class LLMError(DomainError):
 
 _FENCE_RE = re.compile(r"\A```(?:json)?\s*|\s*```\Z")
 
+# Mode response_format json_schema per model yang pernah DITOLAK provider
+# (HTTP 400) dalam proses ini. Incident 21 Nov 2026: setiap panggilan membayar
+# satu round-trip 400 padahal Groq menolak json_schema strict untuk model itu
+# secara konsisten — setelah ditolak sekali, panggilan berikutnya langsung
+# memakai json_object (hemat ±satu round-trip per panggilan, tanpa mengubah
+# model/prompt). In-process saja: proses baru mencoba json_schema lagi, jadi
+# perubahan perilaku provider otomatis terdeteksi.
+_SCHEMA_REJECTED_MODELS: set[str] = set()
+
+
+def reset_schema_rejection_memory() -> None:
+    """Kosongkan memori penolakan json_schema (untuk test — produksi tidak perlu)."""
+    _SCHEMA_REJECTED_MODELS.clear()
+
+
+def _provider_error_message(response: httpx.Response) -> str:
+    """Pesan error provider yang AMAN untuk log (tanpa kunci/prompt)."""
+    try:
+        error = response.json().get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+    except ValueError:
+        message = None
+    text = str(message) if message else f"HTTP {response.status_code}"
+    return text[:200]
+
 
 class GroqClient:
     """Adapter HTTP Groq (OpenAI-compatible /chat/completions)."""
@@ -132,16 +157,33 @@ class GroqClient:
 
     def _call_model(self, model: str, system: str, user: str) -> dict[str, Any]:
         """Satu model: json_schema → (400) json_object → (429/5xx) satu retry."""
-        use_schema = True
+        # Mode json_schema yang sudah pernah ditolak provider untuk model ini
+        # langsung dilewati (hemat satu round-trip 400 per panggilan).
+        use_schema = model not in _SCHEMA_REJECTED_MODELS
         response = self._post(self._request_payload(model, system, user, use_schema))
-        if response.status_code == 400:
-            # Skema JSON ditolak provider → turunkan ke json_object (sekali).
+        if response.status_code == 400 and use_schema:
+            # Skema JSON ditolak provider → turunkan ke json_object (sekali),
+            # catat model ini agar panggilan berikutnya tidak mengulang 400.
+            logger.warning(
+                "Groq menolak json_schema untuk model %s (HTTP 400: %s) — "
+                "panggilan berikutnya memakai json_object.",
+                model,
+                _provider_error_message(response),
+            )
+            _SCHEMA_REJECTED_MODELS.add(model)
             use_schema = False
             response = self._post(self._request_payload(model, system, user, use_schema))
         if self._is_retryable(response.status_code):
             self._wait_retry_after(response)
             response = self._post(self._request_payload(model, system, user, use_schema))
             if response.status_code == 400 and use_schema:
+                logger.warning(
+                    "Groq menolak json_schema untuk model %s (HTTP 400: %s) — "
+                    "panggilan berikutnya memakai json_object.",
+                    model,
+                    _provider_error_message(response),
+                )
+                _SCHEMA_REJECTED_MODELS.add(model)
                 use_schema = False
                 response = self._post(self._request_payload(model, system, user, use_schema))
         if response.status_code != 200:
@@ -181,16 +223,35 @@ class GroqClient:
         return status_code == 429 or 500 <= status_code <= 599
 
     def _post(self, payload: dict[str, Any]) -> httpx.Response:
+        # Durasi per panggilan LLM (observability latensi — Phase 5). Konten
+        # prompt TIDAK pernah masuk log; hanya model + mode response_format.
+        started = time.perf_counter()
         try:
-            return self._http.post(
+            response = self._http.post(
                 "/chat/completions",
                 json=payload,
                 headers={"Authorization": f"Bearer {self._api_key}"},
             )
         except httpx.HTTPError as exc:
+            duration_ms = (time.perf_counter() - started) * 1000
             # Hanya tipe exception yang dicatat — header/kunci tidak pernah masuk log.
-            logger.warning("Panggilan Groq gagal (tanpa respons): %s", type(exc).__name__)
+            logger.warning(
+                "Groq call gagal tanpa respons: model=%s format=%s durasi=%.0fms error=%s",
+                payload.get("model"),
+                (payload.get("response_format") or {}).get("type"),
+                duration_ms,
+                type(exc).__name__,
+            )
             raise LLMError("Layanan AI tidak dapat dihubungi. Silakan coba lagi nanti.") from exc
+        duration_ms = (time.perf_counter() - started) * 1000
+        logger.info(
+            "Groq call: model=%s format=%s status=%s durasi=%.0fms",
+            payload.get("model"),
+            (payload.get("response_format") or {}).get("type"),
+            response.status_code,
+            duration_ms,
+        )
+        return response
 
     def _extract_content(self, response: httpx.Response) -> str:
         try:

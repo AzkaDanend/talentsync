@@ -13,13 +13,23 @@ Aturan main:
 - Vektor lowongan dibaca batch (satu query, bukan N+1 untuk yang sudah ada);
   yang hilang di-embed on the fly via embedding_service.embed_job (guarded);
   tetap gagal → lowongan DILEWATI (tidak ikut dinilai).
+- Transfer DB dipangkas dengan cache proses ber-kesegaran otoritatif-dari-DB:
+  dua query metadata kecil (id + updated_at) dijalankan tiap permintaan, lalu
+  payload lowongan & vektor hanya di-fetch untuk id yang BERUBAH sejak cache
+  terakhir dilihat. Steady-state (katalog stabil) → transfer multi-detik
+  (full-text 849 job + vektor 384 dim ≈ MB-an) dilompati seluruhnya, tanpa
+  staleness: `updated_at` adalah penanda perubahan resmi (semua tulis Job /
+  job_embeddings lewat ORM `onupdate=func.now`; sweep ingestion menulisnya
+  eksplisit) dan nilai cache identik dengan nilai DB untuk updated_at sama.
 - `total` = jumlah lowongan aktif yang BERHASIL dinilai; `items` = top `limit`
   urut overall DESC (tie-break job_id agar deterministik).
 """
 
 from __future__ import annotations
 
+import copy
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 
@@ -33,7 +43,7 @@ from app.core.config import Settings
 from app.models.ai import CvEmbedding, JobEmbedding
 from app.models.job import Job
 from app.models.user import User
-from app.services import embedding_service, match_service
+from app.services import embedding_service, match_service, skill_service, taxonomy_service
 
 logger = logging.getLogger(__name__)
 
@@ -46,25 +56,176 @@ MAX_LIMIT = 25
 # Maksimal nama skill yang tampil di satu item rekomendasi.
 MAX_MATCHED_SKILLS = 5
 
+# Cache proses untuk payload lowongan & vektor (lihat docstring modul).
+# Nilai plain-data (dict/list/datetime) — TANPA objek ORM terikat session.
+_JOB_DATA_CACHE: dict[uuid.UUID, tuple[datetime, dict]] = {}
+_JOB_VECTOR_CACHE: dict[uuid.UUID, tuple[datetime, list[float]]] = {}
+_CACHE_SOFT_CAP = 20_000
 
-def _load_job_vectors(
+
+def reset_recommendation_cache() -> None:
+    """Kosongkan cache payload/vektor rekomendasi (test & CLI/scripts)."""
+    _JOB_DATA_CACHE.clear()
+    _JOB_VECTOR_CACHE.clear()
+
+
+def _job_payload(job: Job) -> dict:
+    """Kolom yang dibutuhkan pipeline rekomendasi dari satu Job → plain dict
+    bebas-session (aman disimpan di cache proses; tanpa objek ORM)."""
+    return {
+        "id": job.id,
+        "title": job.title,
+        "description": job.description,
+        "requirements": job.requirements,
+        "responsibilities": job.responsibilities,
+        "seniority": job.seniority,
+        "skills": copy.deepcopy(job.skills) if job.skills else [],
+        "company_name": job.company.name if job.company is not None else None,
+        "location_text": job.location_text,
+        "employment_type": job.employment_type,
+    }
+
+
+def _sync_job_caches(
+    db: Session, settings: Settings
+) -> tuple[dict[uuid.UUID, dict], dict[uuid.UUID, list[float]], int, int]:
+    """Sinkronkan cache payload & vektor dengan keadaan DB (otoritatif).
+
+    Dua query metadata kecil (id + updated_at) dijalankan setiap permintaan;
+    fetch penuh hanya untuk id yang berubah atau baru. Mengembalikan
+    (payload_by_id, vectors_by_id, jobs_fetched, vectors_fetched) — payload &
+    vektor berisi SELURUH lowongan aktif dan SELURUH vektor aktif model aktif
+    persis seperti hasil query langsung (nilai identik untuk updated_at sama).
+    """
+    active_meta = db.execute(
+        select(Job.id, Job.updated_at).where(Job.status == "active", Job.deleted_at.is_(None))
+    ).all()
+    active_by_id = {jid: upd for jid, upd in active_meta}
+
+    changed_jobs = [
+        jid
+        for jid, upd in active_by_id.items()
+        if (entry := _JOB_DATA_CACHE.get(jid)) is None or entry[0] != upd
+    ]
+    jobs_fetched = 0
+    if changed_jobs:
+        rows = db.scalars(select(Job).where(Job.id.in_(changed_jobs))).all()
+        for job in rows:
+            _JOB_DATA_CACHE[job.id] = (job.updated_at, _job_payload(job))
+        jobs_fetched = len(rows)
+
+    emb_meta = db.execute(
+        select(JobEmbedding.job_id, JobEmbedding.updated_at)
+        .join(Job, JobEmbedding.job_id == Job.id)
+        .where(
+            Job.status == "active",
+            Job.deleted_at.is_(None),
+            JobEmbedding.model == settings.embedding_model,
+            JobEmbedding.text_kind == embedding_service.TEXT_KIND_JOB,
+        )
+    ).all()
+    changed_vecs = [
+        jid
+        for jid, upd in emb_meta
+        if (entry := _JOB_VECTOR_CACHE.get(jid)) is None or entry[0] != upd
+    ]
+    vectors_fetched = 0
+    if changed_vecs:
+        rows = db.execute(
+            select(JobEmbedding.job_id, JobEmbedding.updated_at, JobEmbedding.embedding).where(
+                JobEmbedding.job_id.in_(changed_vecs),
+                JobEmbedding.model == settings.embedding_model,
+                JobEmbedding.text_kind == embedding_service.TEXT_KIND_JOB,
+            )
+        ).all()
+        for jid, upd, emb in rows:
+            _JOB_VECTOR_CACHE[jid] = (upd, list(emb))
+        vectors_fetched = len(rows)
+
+    # Pengaman memori: katalog normal jauh di bawah ini; bila melesat (mis.
+    # proses berumur panjang melihat jutaan id), reset — request berikutnya
+    # membangun ulang cache secara penuh.
+    if len(_JOB_DATA_CACHE) > _CACHE_SOFT_CAP or len(_JOB_VECTOR_CACHE) > _CACHE_SOFT_CAP:
+        logger.warning("Cache rekomendasi melewati %s entri — di-reset.", _CACHE_SOFT_CAP)
+        _JOB_DATA_CACHE.clear()
+        _JOB_VECTOR_CACHE.clear()
+
+    payloads = {jid: _JOB_DATA_CACHE[jid][1] for jid in active_by_id if jid in _JOB_DATA_CACHE}
+    vectors = {jid: _JOB_VECTOR_CACHE[jid][1] for jid, _ in emb_meta if jid in _JOB_VECTOR_CACHE}
+    return payloads, vectors, jobs_fetched, vectors_fetched
+
+
+def _fetch_vectors(
     db: Session, job_ids: list[uuid.UUID], settings: Settings
 ) -> dict[uuid.UUID, list[float]]:
-    """Vektor lowongan model aktif untuk SEKUMPUNGAN id — satu query (anti N+1).
+    """Vektor model aktif untuk SEKUMPUNGAN id — satu query (anti N+1).
 
-    Hanya baris text_kind 'job' milik model aktif (mirror _load_vector di
-    match_service, tapi batch). Baris model lama tidak pernah disentuh.
-    """
+    Baris text_kind 'job' milik model aktif; baris model lama tidak disentuh."""
     if not job_ids:
         return {}
-    rows = db.scalars(
-        select(JobEmbedding).where(
+    rows = db.execute(
+        select(JobEmbedding.job_id, JobEmbedding.updated_at, JobEmbedding.embedding).where(
             JobEmbedding.job_id.in_(job_ids),
             JobEmbedding.model == settings.embedding_model,
             JobEmbedding.text_kind == embedding_service.TEXT_KIND_JOB,
         )
     ).all()
-    return {row.job_id: list(row.embedding) for row in rows}
+    vectors: dict[uuid.UUID, list[float]] = {}
+    for jid, upd, emb in rows:
+        vectors[jid] = list(emb)
+        _JOB_VECTOR_CACHE[jid] = (upd, vectors[jid])
+    return vectors
+
+
+def prime_caches(db: Session, settings: Settings) -> dict:
+    """Bangun seluruh cache rekomendasi yang TIDAK bergantung pengguna.
+
+    Dipanggil saat startup (lihat main._warm_startup_caches) agar request
+    pertama pengguna tidak membayar cold-start — tes manual 22 Nov 2026:
+    request pertama pasca-restart = model (±30 dtk) + encode judul (±23 dtk) +
+    fuzzy (±17 dtk) + transfer DB (±12-46 dtk) ≫ budget axios 20 dtk → UI
+    selalu "timeout of 20000ms exceeded" walau request berikutnya cepat.
+
+    Setiap langkah guarded: kegagalan tidak fatal (jalur on-demand tetap
+    berjalan seperti sebelumnya). Mengembalikan rekap hitungan untuk log."""
+    started = time.perf_counter()
+    payloads, vectors, jobs_fetched, vectors_fetched = _sync_job_caches(db, settings)
+    alias_index = taxonomy_service.load_alias_index(db)
+
+    # Memo normalisasi untuk seluruh nama skill katalog (fuzzy dulu 17 dtk CPU).
+    for payload in payloads.values():
+        skill_service.normalize_job_skills(db, payload["skills"], index=alias_index)
+
+    # Encode judul seluruh lowongan aktif → cache teks (dulu 22-23 dtk CPU).
+    titles = [payload["title"] for payload in payloads.values()]
+    if titles:
+        embedding_service.get_embedder(settings.embedding_model).encode(titles)
+
+    # Lowongan aktif yang belum punya vektor → embed on the fly SEKALI di sini,
+    # bukan menggantung di request pengguna (90 job baru dari ingestion ≈ 90-120 dtk).
+    missing = [jid for jid in payloads if jid not in vectors]
+    embedded = 0
+    for jid in missing:
+        try:
+            embedding_service.embed_job(db, jid, settings)
+            embedded += 1
+        except Exception as embed_error:
+            db.rollback()
+            logger.warning(
+                "Prime embed lowongan %s gagal — dilewati: %s", jid, type(embed_error).__name__
+            )
+    if embedded:
+        vectors.update(_fetch_vectors(db, missing, settings))
+
+    return {
+        "jobs": len(payloads),
+        "vectors": len(vectors),
+        "titles_encoded": len(titles),
+        "jobs_fetched": jobs_fetched,
+        "vectors_fetched": vectors_fetched,
+        "embedded_on_the_fly": embedded,
+        "seconds": round(time.perf_counter() - started, 1),
+    }
 
 
 def _build_reason(
@@ -81,8 +242,8 @@ def _build_reason(
     return f"{base}."
 
 
-def _build_item(job: Job, result: dict) -> dict:
-    """Satu item rekomendasi dari hasil score_pair + metadata lowongan."""
+def _build_item(job: dict, result: dict) -> dict:
+    """Satu item rekomendasi dari hasil score_pair + payload lowongan (cache)."""
     matched = result["matched"]
     missing = result["missing"]
     matched_required = sum(1 for item in matched if item.get("required"))
@@ -93,11 +254,11 @@ def _build_item(job: Job, result: dict) -> dict:
     # sort Python stabil), dipangkas ke MAX_MATCHED_SKILLS nama tampilan.
     ordered = sorted(matched, key=lambda item: not item.get("required"))
     return {
-        "job_id": job.id,
-        "title": job.title,
-        "company": job.company.name if job.company is not None else None,
-        "location": job.location_text,
-        "employment_type": job.employment_type,
+        "job_id": job["id"],
+        "title": job["title"],
+        "company": job["company_name"],
+        "location": job["location_text"],
+        "employment_type": job["employment_type"],
         "overall": overall,
         "label": label_for(overall),
         "matched_required": matched_required,
@@ -123,6 +284,7 @@ def recommend_jobs(
     cv/job_embeddings (commit internal embedding_service, pola M4).
     """
     limit = max(1, min(int(limit), MAX_LIMIT))
+    request_started = time.perf_counter()
 
     # 1) Gate + data kandidat — reuse helper match_service agar gate & sumber
     #    slug PERSIS sama dengan /compatibility (status != rejected; explicit =
@@ -146,26 +308,50 @@ def recommend_jobs(
     ]
     taxonomy_related = match_service.load_taxonomy_related()
 
-    # 2) Lowongan eligible: aktif & belum dihapus (draft/closed/paused di luar).
-    jobs = list(
-        db.scalars(select(Job).where(Job.status == "active", Job.deleted_at.is_(None))).all()
-    )
+    # 2+3) Lowongan aktif + vektor — via cache ber-kesegaran otoritatif DB:
+    # metadata kecil tiap request, fetch penuh hanya untuk id yang berubah.
+    # Payload berupa plain-dict bebas-session (kebal rollback — dulu rollback
+    # jalur gagal-embed meng-expire 849 objek ORM dan memicu reload per objek).
+    vectors_started = time.perf_counter()
+    payloads, job_vecs, jobs_fetched, vectors_fetched = _sync_job_caches(db, settings)
+    active_ids = list(payloads)
 
-    # 3) Vektor lowongan: batch load → embed on the fly yang hilang → baca ulang.
-    job_vecs = _load_job_vectors(db, [job.id for job in jobs], settings)
-    for job in jobs:
-        if job.id in job_vecs:
-            continue
+    missing = [jid for jid in active_ids if jid not in job_vecs]
+    for job_id in missing:
         try:
-            embedding_service.embed_job(db, job.id, settings)
-        except Exception:
+            embedding_service.embed_job(db, job_id, settings)
+        except Exception as embed_error:
+            # Dilewati (lowongan ini tidak ikut dinilai) — kegagalan operasional
+            # yang diharapkan: log ringkas per kejadian, TANPA traceback penuh
+            # (dulu membanjiri terminal saat DB tidak stabil).
             db.rollback()  # bersihkan transaksi; lowongan ini saja yang dilewati
-            logger.warning("Embed on the fly lowongan %s gagal — dilewati.", job.id, exc_info=True)
-    still_missing = [job.id for job in jobs if job.id not in job_vecs]
-    job_vecs.update(_load_job_vectors(db, still_missing, settings))
+            logger.warning(
+                "Embed on the fly lowongan %s gagal — dilewati: %s",
+                job_id,
+                type(embed_error).__name__,
+            )
+    if missing:
+        # Ambil vektor yang baru saja di-embed on the fly (kecil: hanya id yang
+        # tadi hilang) dan masukkan ke cache — kesegaran tetap otoritatif.
+        fresh = db.execute(
+            select(JobEmbedding.job_id, JobEmbedding.updated_at, JobEmbedding.embedding).where(
+                JobEmbedding.job_id.in_(missing),
+                JobEmbedding.model == settings.embedding_model,
+                JobEmbedding.text_kind == embedding_service.TEXT_KIND_JOB,
+            )
+        ).all()
+        for jid, upd, emb in fresh:
+            _JOB_VECTOR_CACHE[jid] = (upd, list(emb))
+            job_vecs[jid] = _JOB_VECTOR_CACHE[jid][1]
+    embed_on_the_fly_ms = (time.perf_counter() - vectors_started) * 1000
 
-    eligible = [job for job in jobs if job.id in job_vecs]
+    eligible = [payloads[jid] for jid in active_ids if jid in job_vecs]
     cv_title_vecs: list[list[float]] = []
+    # Vektor judul lowongan: WAJIB didefinisikan di sini (bukan hanya di dalam
+    # `if eligible`) — zip(..., strict=True) dievaluasi meski eligible kosong,
+    # dan variabel tak terdefinisi berarti UnboundLocalError (500) ketika TIDAK
+    # ada satu pun lowongan aktif yang bisa dinilai.
+    job_title_vecs: list[list[float]] = []
     if eligible:
         # Encoder judul terikat model aktif — fallback defensif bila vektor judul
         # tak sejajar (normalnya tidak pernah dipakai, mirror match_service).
@@ -177,28 +363,41 @@ def recommend_jobs(
         # SATU batch untuk semua judul: judul lowongan (per pasangan) + judul
         # pengalaman CV (sekali per request) — tanpa encode ulang per pasangan.
         encoded = embedding_service.get_embedder(settings.embedding_model).encode(
-            [*(job.title for job in eligible), *experience_titles]
+            [*(payload["title"] for payload in eligible), *experience_titles]
         )
         n_jobs = len(eligible)
         job_title_vecs = [list(vector) for vector in encoded[:n_jobs]]
         cv_title_vecs = [list(vector) for vector in encoded[n_jobs:]]
 
-    # 4) Skor per pasangan — skill lowongan di-resolve per job (mirror M4).
-    scored: list[tuple[Job, dict]] = []
+    # 4) Skor per pasangan — skill lowongan di-resolve SEKALI untuk semua
+    #    lowongan (anti N+1): satu indeks alias + satu query CanonicalSkill
+    #    untuk seluruh batch. Dulu _resolve_job_skills dipanggil per lowongan →
+    #    ratusan query indeks/query kanon per request (incident 21 Nov 2026,
+    #    1-4 dtk per query via pooler = latensi menit-an).
+    alias_index = taxonomy_service.load_alias_index(db)  # cache per proses — sekali muat
+    normalized_by_job = {
+        payload["id"]: skill_service.normalize_job_skills(db, payload["skills"], index=alias_index)
+        for payload in eligible
+    }
+    canon_by_id = skill_service.canonical_map_for_normalized(db, normalized_by_job)
+
+    scored: list[tuple[dict, dict]] = []
     for job, job_title_vec in zip(eligible, job_title_vecs, strict=True):
         job_dict = {
-            "title": job.title,
-            "skills": match_service._resolve_job_skills(db, job),
-            "description": job.description,
-            "requirements": job.requirements,
-            "responsibilities": job.responsibilities,
-            "seniority": job.seniority,
+            "title": job["title"],
+            "skills": skill_service.resolve_normalized_skills(
+                normalized_by_job[job["id"]], canon_by_id
+            ),
+            "description": job["description"],
+            "requirements": job["requirements"],
+            "responsibilities": job["responsibilities"],
+            "seniority": job["seniority"],
         }
         result = score_pair(
-            cv_payload=payload,
+            cv_payload=payload,  # payload CV (bukan job) — didefinisikan di tahap 1
             job=job_dict,
             cv_vec=cv_vec,
-            job_vec=job_vecs[job.id],
+            job_vec=job_vecs[job["id"]],
             job_title_vec=job_title_vec,
             candidate_slugs=candidate_slugs,
             explicit_slugs=explicit_slugs,
@@ -209,8 +408,24 @@ def recommend_jobs(
         scored.append((job, result))
 
     # 5) Urut overall DESC (tie-break job_id → deterministik), ambil top limit.
-    scored.sort(key=lambda pair: (-float(pair[1]["overall"]), pair[0].id))
+    scored.sort(key=lambda pair: (-float(pair[1]["overall"]), pair[0]["id"]))
     items = [_build_item(job, result) for job, result in scored[:limit]]
+
+    # Observability latensi jalur rekomendasi (Phase 5): satu baris INFO per
+    # permintaan dengan durasi per tahap + hitungan — cukup untuk melihat
+    # bottleneck (DB vs embed vs scoring) tanpa mencemari log request lain.
+    total_ms = (time.perf_counter() - request_started) * 1000
+    logger.info(
+        "Rekomendasi: %s lowongan aktif, %s dinilai, %s item — total %.0f ms "
+        "(embed on-the-fly %.0f ms; fetch job=%s, vektor=%s — 0 berarti cache hangat).",
+        len(active_ids),
+        len(scored),
+        len(items),
+        total_ms,
+        embed_on_the_fly_ms,
+        jobs_fetched,
+        vectors_fetched,
+    )
 
     return {
         "cv_id": cv.id,

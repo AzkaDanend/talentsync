@@ -58,6 +58,7 @@ function RecommendationCard({ item, rank }: { item: RecommendationItem; rank: nu
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <Link
             to={`/app/jobs/${item.job_id}`}
+            state={{ from: "recommendations" }}
             data-recommendation-link
             className="text-base font-semibold text-primary-700 underline decoration-primary-200 underline-offset-2 hover:decoration-primary-500"
           >

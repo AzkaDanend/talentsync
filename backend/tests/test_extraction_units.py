@@ -356,7 +356,19 @@ def test_build_payload_bilingual_variants():
 
 @pytest.mark.parametrize(
     "text",
-    ["", "   ", "@@@ ### !!!", "====", "—", "•", "2023-01 - sekarang", "x" * 250_000],
+    [
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="whitespace-only"),
+        pytest.param("@@@ ### !!!", id="punct"),
+        pytest.param("====", id="equals"),
+        pytest.param("—", id="em-dash"),
+        pytest.param("•", id="bullet"),
+        pytest.param("2023-01 - sekarang", id="period-line"),
+        # ID param harus pendek: test ID 250k karakter melebihi batas env var
+        # Windows (PYTEST_CURRENT_TEST ≤ 32.767 char) → error setup, bukan
+        # kegagalan kode. Isi param tetap 250k char.
+        pytest.param("x" * 250_000, id="huge-250k"),
+    ],
 )
 def test_build_payload_never_raises_on_garbage(text):
     payload = build_payload(text)

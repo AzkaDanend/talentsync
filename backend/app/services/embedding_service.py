@@ -3,9 +3,11 @@
 Aturan main:
 - Hanya CV dengan ekstraksi TERKONFIRMASI (confirmed_at terisi, payload ada)
   yang di-embed — hard gate, hasil review kandidat adalah sumber kebenaran.
-- Upsert per (dokumen, model, text_kind): baris lama untuk kunci yang sama
-  dihapus dulu, baris baru disisipkan. Baris model LAMA tidak pernah dihapus
-  (retensi multi-versi — roll-back model bisa membandingkan skor antar versi).
+- Upsert idempoten per (dokumen, model, text_kind): INSERT dulu; bila baris
+  kunci yang sama sudah ada (request konkuren / re-embed), baris existing
+  di-UPDATE. Tepat satu baris per kunci bahkan di bawah request bersamaan.
+  Baris model LAMA tidak pernah disentuh (retensi multi-versi — roll-back
+  model bisa membandingkan skor antar versi).
 - Upsert berjalan di dalam SAVEPOINT (`begin_nested`): bila gagal, hanya
   bagian embedding yang dibatalkan — transaksi luar (skills/confirm/publish)
   tetap sehat dan commit normal oleh pemanggil.
@@ -20,6 +22,7 @@ import uuid
 from collections.abc import Callable
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.ai.matching.embedder import TextEmbedder, build_cv_text, build_job_text, get_embedder
@@ -56,37 +59,60 @@ def _upsert_embedding(
     text_kind: str,
     vector: list[float],
 ) -> bool:
-    """Upsert satu baris embedding (delete-then-insert) di dalam SAVEPOINT.
+    """Upsert satu baris embedding — idempoten di bawah request konkuren.
 
-    Mengembalikan True bila upsert berhasil (pemanggil lalu commit). Bila
-    gagal: log warning + False — transaksi luar TIDAK tercemar.
+    Strategi INSERT-first (bukan delete-then-insert): delete-then-insert tidak
+    atomik antar transaksi — dua request yang men-embed dokumen yang sama
+    bersamaan sama-sama tidak melihat baris lama, sama-sama INSERT, dan yang
+    kedua menabrak UNIQUE constraint uq_*_doc_id (incident 21 Nov 2026).
+    INSERT-first memindahkan penyelesaian konflik ke database: bila baris kunci
+    yang sama sudah ada (menang balapan atau re-embed), baris existing di-
+    UPDATE dengan vektor baru — hasil akhir PASTI tepat satu baris.
+
+    Operasi berjalan di dalam SAVEPOINT (`begin_nested`): kegagalan hanya
+    membatalkan bagian embedding — transaksi luar (skills/confirm/publish)
+    tetap sehat dan commit normal oleh pemanggil.
     """
+    row_kwargs = {
+        doc_field: doc_id,
+        "model": model,
+        "text_kind": text_kind,
+        "embedding": vector,
+    }
     try:
         with db.begin_nested():
-            # Hapus baris kunci yang sama dulu, flush agar urutan DELETE
-            # mendahului INSERT (UNIQUE constraint), baru sisipkan baris baru.
-            existing = db.scalars(
+            db.add(model_cls(**row_kwargs))
+            db.flush()  # INSERT; IntegrityError bila baris sudah ada
+        return True
+    except IntegrityError:
+        pass  # baris sudah ada → jalur update di bawah (bukan kegagalan sebenarnya)
+    except Exception:
+        logger.warning(
+            "Upsert embedding %s (%s) gagal — dilewati, transaksi utama tetap lanjut.",
+            model_cls.__tablename__,
+            doc_id,
+            exc_info=True,
+        )
+        return False
+
+    # Jalur update/tulis-ulang: baris menang balapan sudah commit. Bila baris
+    # ternyata sudah dihapus penulis lain, tulis ulang di SAVEPOINT yang sama.
+    try:
+        with db.begin_nested():
+            row = db.scalars(
                 select(model_cls)
                 .where(getattr(model_cls, doc_field) == doc_id)
                 .where(model_cls.model == model)
                 .where(model_cls.text_kind == text_kind)
-            ).all()
-            for row in existing:
-                db.delete(row)
+            ).first()
+            if row is None:
+                db.add(model_cls(**row_kwargs))
+            else:
+                row.embedding = vector  # ORM update → updated_at ikut dibump
             db.flush()
-            db.add(
-                model_cls(
-                    **{
-                        doc_field: doc_id,
-                        "model": model,
-                        "text_kind": text_kind,
-                        "embedding": vector,
-                    }
-                )
-            )
     except Exception:
         logger.warning(
-            "Upsert embedding %s (%s) gagal — dilewati, transaksi utama tetap lanjut.",
+            "Update embedding %s (%s) gagal — dilewati, transaksi utama tetap lanjut.",
             model_cls.__tablename__,
             doc_id,
             exc_info=True,

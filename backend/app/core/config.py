@@ -84,9 +84,13 @@ class Settings(BaseSettings):
     # M3 — Embedding: muat model & simpan vektor saat konfirmasi/publikasi.
     # Nonaktif di unit test (hemat RAM/waktu); E2E & produksi tetap aktif.
     embeddings_enabled: bool = True
-    # True = pre-warm model BLOKIR startup (dipakai E2E agar deterministic —
-    # model pasti siap sebelum test pertama); False = thread latar (produksi).
-    embedding_prewarm_sync: bool = False
+    # True (default): startup BLOKIR hingga model siap + cache rekomendasi
+    # (payload job, vektor, encode judul, memo skill) terisi — request pertama
+    # pengguna ≈ 1-2 dtk, bukan timeout 20 dtk (tes manual 22 Nov 2026).
+    # Startup jadi ±30-90 dtk sebelum port dibuka. False = thread latar
+    # (request awal membayar sebagian cold-start) — dipakai bila kecepatan
+    # startup lebih penting daripada latensi request pertama.
+    embedding_prewarm_sync: bool = True
 
     @field_validator("skill_fuzzy_threshold")
     @classmethod

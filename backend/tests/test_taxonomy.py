@@ -5,9 +5,11 @@ import re
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 import app.models  # noqa: F401 — daftarkan model
 from app.core.config import Settings
+from app.models.skill import CanonicalSkill
 from app.services import taxonomy_service as ts
 
 GOLDEN_CV_DIR = Path(__file__).resolve().parents[2] / "eval" / "golden" / "cvs"
@@ -362,3 +364,180 @@ class TestSettings:
             Settings(app_env="test", secret_key="x" * 8, skill_fuzzy_threshold=0.3)
         with pytest.raises(ValueError):
             Settings(app_env="test", secret_key="x" * 8, skill_fuzzy_threshold=1.5)
+
+
+# --- Cache indeks alias (per proses) harus bebas-sesi (review tahap-2) ---
+
+
+def test_alias_index_cache_survives_source_session_rollback(db_session, seeded_taxonomy):
+    """Cache dibangun session A → A rollback (expire semua objek attached) →
+    atribut objek cache tetap terbaca. Tanpa expunge, rollback di session yang
+    pertama membangun cache (mis. jalur gagal embed di recommend_jobs) meracuni
+    cache proses: request berikutnya kena DetachedInstanceError saat membaca
+    .slug/.name — gagal sampai proses restart."""
+    # seeded_taxonomy men-seed via seed_from_json (me-reset cache) — cache di
+    # bawah benar-benar dibangun dari objek milik session ini.
+    ts.reset_alias_index_cache()
+    index = ts.load_alias_index(db_session)
+    assert len(index) > 0
+
+    db_session.rollback()  # expire SEMUA objek attached ke session ini
+
+    for skill in list(index.values())[:5]:
+        assert skill.slug
+        assert skill.name
+        assert skill.id is not None
+
+
+def test_alias_index_cache_reset_by_seed(db_session, seeded_taxonomy):
+    """seed_from_json mengubah taksonomi → cache harus di-reset agar tidak basi."""
+    ts.reset_alias_index_cache()
+    before = ts.load_alias_index(db_session)
+    assert len(before) > 0
+
+    # Seed ulang dengan berkas yang sama — cache tetap di-reset (idempoten);
+    # indeks setelahnya harus tetap konsisten dengan isi DB.
+    ts.seed_from_json(db_session)
+    after = ts.load_alias_index(db_session)
+    assert set(after.keys()) == set(before.keys())
+
+
+def test_expunge_keeps_attributes_loaded_after_rollback(db_session, seeded_taxonomy):
+    """Unit dasar expunge: objek detached non-expired mempertahankan state."""
+    first = db_session.scalars(select(CanonicalSkill).limit(3)).all()[0]
+    slug_loaded = first.slug
+    db_session.expunge(first)
+    db_session.rollback()
+    assert first.slug == slug_loaded
+    assert first.id is not None
+
+
+# --- Memo normalisasi per nama skill (review tahap-3: tahap resolve 103 dtk CPU) ---
+
+
+def _count_sequence_matcher(monkeypatch) -> list[int]:
+    """Ganti SequenceMatcher modul dengan pembungkus penghitung pemanggilan."""
+    counter = [0]
+    real = ts.SequenceMatcher
+
+    class Counting(real):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            counter[0] += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(ts, "SequenceMatcher", Counting)
+    return counter
+
+
+def test_normalize_memo_repeated_name_computed_once(db_session, seeded_taxonomy, monkeypatch):
+    """Nama skill yang sama TIDAK menjalankan fuzzy matching berulang: keputusan
+    dihitung sekali per (query, threshold) selama cache valid."""
+    ts.reset_alias_index_cache()
+    counter = _count_sequence_matcher(monkeypatch)
+
+    unknown = "zzqq-unknown-skill-zzqq"  # pasti meleset exact/alias → jalur fuzzy
+    first = ts.normalize_skill(db_session, unknown)
+    fuzzy_calls_first = counter[0]
+    assert fuzzy_calls_first > 0  # jalur fuzzy memang berjalan
+
+    second = ts.normalize_skill(db_session, unknown)
+    assert counter[0] == fuzzy_calls_first  # TANPA tambahan pemanggilan SequenceMatcher
+    assert second == first
+    # Saran (list of dict) salinan segar — mutasi tidak meracuni memo.
+    second["suggestions"].append({"slug": "racun", "name": "racun", "score": 1.0})
+    third = ts.normalize_skill(db_session, unknown)
+    assert third == first
+
+    # Nama fuzzy-hit & exact juga ter-memo: hasil identik dipanggil ulang.
+    fuzzy_first = ts.normalize_skill(db_session, "pythonn")
+    fuzzy_second = ts.normalize_skill(db_session, "pythonn")
+    assert fuzzy_second == fuzzy_first
+    assert fuzzy_first["method"] == "fuzzy"
+    exact_first = ts.normalize_skill(db_session, "Python")
+    exact_second = ts.normalize_skill(db_session, "Python")
+    assert exact_second == exact_first
+    assert exact_first["method"] == "exact"
+
+
+def _result_view(result: dict) -> dict:
+    """Tampilan perbandingan: canonical disamakan per BARIS DB (slug, id, name) —
+    instance Python bisa berbeda antar pembangunan indeks (row sama)."""
+    canonical = result["canonical"]
+    row = None if canonical is None else (canonical.slug, str(canonical.id), canonical.name)
+    return {**result, "canonical": row}
+
+
+def test_normalize_memo_results_identical_across_variations(db_session, seeded_taxonomy):
+    """Hasil memo identik dengan jalur tanpa memo untuk variasi nama:
+    exact, alias, fuzzy, dan gagal (needs_review + saran)."""
+    ts.reset_alias_index_cache()
+    variations = ["Python", "  PYTHON  ", "pythonn", "zzqq-unknown-skill-zzqq", ""]
+    with_memo = [_result_view(ts.normalize_skill(db_session, name)) for name in variations]
+
+    # Jalur acuan tanpa memo: reset lalu hitung ulang hasil yang sama.
+    ts.reset_alias_index_cache()
+    without_memo = [_result_view(ts.normalize_skill(db_session, name)) for name in variations]
+
+    for memoized, fresh in zip(with_memo, without_memo, strict=True):
+        assert memoized == fresh
+    assert without_memo[0]["method"] == "exact"
+    assert without_memo[1]["method"] == "exact"  # whitespace di-trim + lowercase
+    assert without_memo[2]["method"] == "fuzzy"  # typo → fuzzy unik
+    assert without_memo[3]["method"] == "none" and without_memo[3]["needs_review"]
+    assert without_memo[4]["method"] == "none"
+
+    # Nilai memo murni data — tanpa objek ORM terikat session.
+    for key, decision in ts._NORMALIZE_CACHE.items():
+        method, matched_nk, confidence, needs_review, suggestions = decision
+        assert method in ("exact", "alias", "fuzzy", "none")
+        assert isinstance(key[0], str) and isinstance(key[1], float)
+        assert isinstance(confidence, float) and isinstance(needs_review, bool)
+        assert isinstance(suggestions, tuple)
+
+
+def test_normalize_memo_invalidated_by_taxonomy_change(db_session, seeded_taxonomy, tmp_path):
+    """seed_from_json mengubah taksonomi (alias baru) → memo invalidasi: nama yang
+    tadinya 'none' kini terpetakan alias ke skill kanon yang benar."""
+    ts.reset_alias_index_cache()
+    unknown = "zzqq-unknown-skill-zzqq"
+    before = ts.normalize_skill(db_session, unknown)
+    assert before["method"] == "none"
+    # Panggilan ulang agar keputusan lama ter-memo.
+    assert ts.normalize_skill(db_session, unknown) == before
+
+    # Taksonomi baru: nama tsb menjadi alias resmi untuk skill Python.
+    data = json.loads(ts.DEFAULT_TAXONOMY_JSON.read_text(encoding="utf-8"))
+    for item in data["skills"]:
+        if item["slug"] == "python":
+            item["aliases"] = list(item.get("aliases", [])) + [unknown]
+            break
+    else:  # pragma: no cover — slug python wajib ada di taksonomi golden
+        raise AssertionError("slug python tidak ditemukan di taksonomi")
+    custom = tmp_path / "skills_custom.json"
+    custom.write_text(json.dumps(data), encoding="utf-8")
+
+    summary = ts.seed_from_json(db_session, custom)  # reset cache di dalamnya
+    after = ts.normalize_skill(db_session, unknown)
+    assert after["method"] == "alias"
+    assert after["canonical"].slug == "python"
+    assert summary["version"] == data["version"]
+
+
+def test_normalize_memo_survives_source_session_rollback(db_session, seeded_taxonomy):
+    """Memo terisi oleh session A → A rollback (expire objeknya) → hasil memo
+    tetap terbaca dari session B: nilai memo bebas-sesi, objek kanon berasal
+    dari indeks alias yang sudah di-expunge."""
+    ts.reset_alias_index_cache()
+    name = "pythonn"  # jalur fuzzy → keputusan ter-memo
+    expected = ts.normalize_skill(db_session, name)
+
+    db_session.rollback()  # expire SEMUA objek attached ke session A
+
+    other = db_session.__class__(bind=db_session.get_bind(), expire_on_commit=False)
+    try:
+        again = ts.normalize_skill(other, name)
+        assert again == expected
+        assert again["canonical"].slug == expected["canonical"].slug
+        assert again["canonical"].name == expected["canonical"].name
+    finally:
+        other.close()

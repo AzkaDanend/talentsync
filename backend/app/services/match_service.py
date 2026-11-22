@@ -191,6 +191,8 @@ def _resolve_job_skills(db: Session, job: Job) -> list[dict]:
 
     Mirror normalisasi job_skills (dedupe per slug, OR-merge required; raw tanpa
     padanan tetap dilaporkan dengan slug None — dikecualikan dari coverage).
+    Pemetaan baris → bentuk kontrak di-delegasikan ke skill_service
+    (resolve_normalized_skills) agar identik dengan jalur batch rekomendasi.
     """
     normalized = skill_service.normalize_job_skills(db, job.skills or [])
     ids = {item["canonical_skill_id"] for item in normalized if item["canonical_skill_id"]}
@@ -198,19 +200,7 @@ def _resolve_job_skills(db: Session, job: Job) -> list[dict]:
     if ids:
         rows = db.scalars(select(CanonicalSkill).where(CanonicalSkill.id.in_(ids)))
         canon_by_id = {canon.id: canon for canon in rows}
-
-    resolved: list[dict] = []
-    for item in normalized:
-        canon = canon_by_id.get(item["canonical_skill_id"]) if item["canonical_skill_id"] else None
-        resolved.append(
-            {
-                "name": item["raw_name"],
-                "slug": canon.slug if canon is not None else None,
-                "display": canon.name if canon is not None else item["raw_name"],
-                "required": bool(item["required"]),
-            }
-        )
-    return resolved
+    return skill_service.resolve_normalized_skills(normalized, canon_by_id)
 
 
 def _load_candidate_slugs(db: Session, user: User) -> tuple[set[str], set[str]]:

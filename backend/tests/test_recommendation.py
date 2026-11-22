@@ -6,12 +6,15 @@ test_matching/test_embedding agar perilaku identik dengan matching M4 (gate
 MATCH_UNAVAILABLE, normalisasi skill, sumber slug CandidateSkill).
 """
 
+import logging
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from app.ai.matching import embedder as embedder_module
 from app.ai.matching import scorer
 from app.ai.matching.explainer import label_for
 from app.models.ai import JobEmbedding, MatchResult
@@ -307,6 +310,54 @@ class TestRecommendJobsService:
         assert result["total"] == 1
         assert [item["job_id"] for item in result["items"]] == [job_ok.id]
 
+    def test_embed_failure_rollback_does_not_cause_reload_storm(
+        self, db_session, seeded_taxonomy, monkeypatch
+    ):
+        """db.rollback() pada jalur gagal-embed meng-expire SELURUH objek session —
+        tanpa re-hydrate terkontrol, akses .id/.skills/.title berikutnya memicu
+        reload per objek (849 SELECT via pooler saat satu embed gagal). UUID
+        ditangkap sebelum loop dan objek Job di-hydrate ulang SEKALI batch."""
+        monkeypatch.setattr(embedding_service, "get_embedder", _fake_factory)
+        user, cv, hr, company = _seed_world(
+            db_session, "rec-storm@example.dev", "rec-hr9@example.dev"
+        )
+        job_ok = _seed_rec_job(db_session, hr, company, skills=SKILLS_FULL)
+        job_bad = _seed_rec_job(db_session, hr, company, skills=SKILLS_NONE)
+        embedding_service.embed_cv(db_session, cv.id, _svc_settings())
+
+        real_embed_job = embedding_service.embed_job
+
+        def flaky_embed_job(db, job_id, settings, **kwargs):
+            if job_id == job_bad.id:
+                # Gagal SETELAH transaksi aktif (meniru insiden nyata:
+                # IntegrityError di flush/savepoint) agar rollback benar-benar
+                # meng-expire objek session, bukan no-op.
+                db.scalars(select(Job)).all()
+                raise RuntimeError("simulasi gagal embed lowongan")
+            return real_embed_job(db, job_id, settings, **kwargs)
+
+        monkeypatch.setattr(embedding_service, "embed_job", flaky_embed_job)
+
+        job_selects: list[str] = []
+
+        def _count_jobs_select(conn, cursor, stmt, params, many, extra):
+            if "FROM jobs" in stmt:
+                job_selects.append(stmt)
+
+        event.listen(db_session.get_bind(), "before_cursor_execute", _count_jobs_select)
+        try:
+            result = recommendation_service.recommend_jobs(db_session, user, _svc_settings())
+        finally:
+            event.remove(db_session.get_bind(), "before_cursor_execute", _count_jobs_select)
+
+        # Hasil tetap benar (lowongan gagal dilewati), dan query tabel jobs
+        # tetap terbatas: 1 (lowongan aktif) + 1 (fake test) + 1 (re-hydrate).
+        assert result["total"] == 1
+        assert [item["job_id"] for item in result["items"]] == [job_ok.id]
+        assert len(job_selects) <= 3, (
+            f"reload-storm: {len(job_selects)} query jobs — {job_selects[:5]}"
+        )
+
 
 class TestCandidateSlugSource:
     def test_rejected_skill_excluded_from_recommendations(
@@ -494,3 +545,315 @@ class TestRecommendationsAPI:
             assert resp.status_code == 422
             resp = client.get("/api/v1/me/recommendations?limit=26", headers=cand_headers)
             assert resp.status_code == 422
+
+
+# =====================================================================
+# 3. Ketahanan — incident 21 Nov 2026 (500 saat koneksi DB terputus)
+# =====================================================================
+
+
+class TestRecommendationsResilience:
+    def test_db_failure_during_recommendation_returns_503_envelope(
+        self, db_engine, seeded_taxonomy, monkeypatch
+    ):
+        """Regression GET /me/recommendations?limit=3 (incident 21 Nov 2026).
+
+        Dulu: psycopg.OperationalError saat query lowongan aktif
+        (recommendation_service) → HTTP 500 + traceback panjang. Kini kegagalan
+        DBAPI dipetakan 503 DEPENDENCY_UNAVAILABLE dengan envelope request_id —
+        bukan 500, dan log tetap ringkas (tanpa SQL/traceback di level ERROR).
+        """
+        with _make_match_client(db_engine, monkeypatch) as client:
+            _reg, cand_headers = make_candidate(client)
+            _hr_reg, hr_headers, _company = make_hr_with_company(client)
+            cv = upload_cv(client, cand_headers, make_multiline_pdf(CV_LINES))
+            get_extraction(client, cand_headers, cv["id"])
+            resp = client.put(f"/api/v1/cvs/{cv['id']}/extraction/confirm", headers=cand_headers)
+            assert resp.status_code == 200, resp.text
+            job = create_job(client, hr_headers, skills=[{"name": "SQL", "required": True}])
+            resp = client.post(f"/api/v1/hr/jobs/{job['id']}/publish", headers=hr_headers)
+            assert resp.status_code == 200, resp.text
+
+            # Simulasikan kegagalan koneksi (SSL EOF / pooler mati) tepat pada
+            # query lowongan aktif — jalur persis seperti traceback incident.
+            def fail_jobs_query(state):
+                if state.is_select and "FROM jobs" in str(state.statement):
+                    orig = Exception("SSL connection has been closed unexpectedly")
+                    raise OperationalError(str(state.statement), {}, orig)
+
+            event.listen(Session, "do_orm_execute", fail_jobs_query)
+
+            # Tangkap log logger app.core.errors langsung — configure_logging
+            # mengganti root.handlers (create_app), sehingga fixture caplog
+            # (handler di root) tidak lagi menerima record aplikasi.
+            captured: list[logging.LogRecord] = []
+
+            class _Capture(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    captured.append(record)
+
+            capture_handler = _Capture(level=logging.ERROR)
+            errors_logger = logging.getLogger("app.core.errors")
+            errors_logger.addHandler(capture_handler)
+            try:
+                resp = client.get("/api/v1/me/recommendations?limit=3", headers=cand_headers)
+            finally:
+                event.remove(Session, "do_orm_execute", fail_jobs_query)
+                errors_logger.removeHandler(capture_handler)
+
+            assert resp.status_code == 503, resp.text
+            body = resp.json()
+            assert body["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+            assert body["error"]["request_id"]
+            assert "X-Request-ID" in resp.headers
+
+            # Log ERROR ringkas: tipe exception disebut, SQL & traceback tidak.
+            messages = [record.getMessage() for record in captured]
+            assert any("Kegagalan database" in message for message in messages), messages
+            assert any("OperationalError" in message for message in messages), messages
+            all_text = " ".join(messages)
+            assert "SSL connection has been closed unexpectedly" not in all_text
+            assert "FROM jobs" not in all_text
+
+    def test_no_active_jobs_returns_empty_result(self, db_engine, seeded_taxonomy, monkeypatch):
+        """Edge case: tidak ada lowongan aktif → 200 dengan total=0 dan items=[]
+        (bukan 500 maupun MATCH_UNAVAILABLE — CV kandidat valid)."""
+        with _make_match_client(db_engine, monkeypatch) as client:
+            _reg, cand_headers = make_candidate(client)
+            cv = upload_cv(client, cand_headers, make_multiline_pdf(CV_LINES))
+            get_extraction(client, cand_headers, cv["id"])
+            resp = client.put(f"/api/v1/cvs/{cv['id']}/extraction/confirm", headers=cand_headers)
+            assert resp.status_code == 200, resp.text
+
+            resp = client.get("/api/v1/me/recommendations", headers=cand_headers)
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["total"] == 0
+            assert body["items"] == []
+            assert body["cv_id"] == cv["id"]
+
+
+class TestRecommendationsMemoStability:
+    def test_ranking_identical_cold_warm_and_reset_memo(
+        self, db_session, seeded_taxonomy, monkeypatch
+    ):
+        """Memo normalisasi TIDAK boleh mengubah hasil: ranking, skor, dan
+        metadata identik untuk fixture yang sama — memo dingin, memo hangat,
+        dan memo dingin setelah reset (indeks dibangun ulang)."""
+        monkeypatch.setattr(embedding_service, "get_embedder", _fake_factory)
+        from app.services import taxonomy_service
+
+        user, cv, hr, company = _seed_world(
+            db_session, "rec-memo@example.dev", "rec-hr10@example.dev"
+        )
+        _seed_rec_job(db_session, hr, company, skills=SKILLS_FULL)
+        _seed_rec_job(db_session, hr, company, skills=SKILLS_PARTIAL)
+        _seed_rec_job(db_session, hr, company, skills=SKILLS_NONE)
+        settings = _svc_settings()
+
+        def snapshot(result: dict) -> dict:
+            # computed_at sengaja dikecualikan (waktu komputasi).
+            return {
+                "cv_id": result["cv_id"],
+                "model_version": result["model_version"],
+                "total": result["total"],
+                "items": result["items"],
+            }
+
+        cold1 = snapshot(recommendation_service.recommend_jobs(db_session, user, settings))
+        warm = snapshot(recommendation_service.recommend_jobs(db_session, user, settings))
+        taxonomy_service.reset_alias_index_cache()  # memo + indeks dingin kembali
+        cold2 = snapshot(recommendation_service.recommend_jobs(db_session, user, settings))
+
+        assert warm == cold1
+        assert cold2 == cold1
+
+
+# =====================================================================
+# 4. Cache DB ber-kesegaran otoritatif (updated_at) — optimasi tahap 3
+# =====================================================================
+
+
+class TestRecommendationsDbCache:
+    def test_second_request_skips_heavy_fetches(self, db_session, seeded_taxonomy, monkeypatch):
+        """Request kedua pada katalog yang tidak berubah TIDAK men-fetch ulang
+        full-text jobs maupun vektor (transfer MB-an dilompati), dan hasilnya
+        identik dengan request pertama."""
+        import time as time_module
+
+        monkeypatch.setattr(embedding_service, "get_embedder", _fake_factory)
+        user, cv, hr, company = _seed_world(
+            db_session, "rec-dbcache@example.dev", "rec-hr11@example.dev"
+        )
+        _seed_rec_job(db_session, hr, company, skills=SKILLS_FULL)
+        _seed_rec_job(db_session, hr, company, skills=SKILLS_PARTIAL)
+        settings = _svc_settings()
+
+        log: list[str] = []
+
+        def _record(conn, cursor, stmt, params, many, extra):
+            log.append(" ".join(stmt.split()))
+
+        event.listen(db_session.get_bind(), "before_cursor_execute", _record)
+
+        first = recommendation_service.recommend_jobs(db_session, user, settings)
+        heavy_first = sum(
+            1 for stmt in log if "jobs.description" in stmt or "job_embeddings.embedding" in stmt
+        )
+        assert heavy_first >= 2  # full-text jobs + vektor di-fetch saat dingin
+
+        log.clear()
+        time_module.sleep(1.05)  # SQLite CURRENT_TIMESTAMP presisi detik: pastikan
+        # timestamp "sekarang" untuk perbandingan metadata berada di detik berbeda
+        second = recommendation_service.recommend_jobs(db_session, user, settings)
+
+        heavy_second = sum(
+            1 for stmt in log if "jobs.description" in stmt or "job_embeddings.embedding" in stmt
+        )
+        assert heavy_second == 0  # cache hangat: transfer berat dilompati
+        # Hasil identik (computed_at dikecualikan).
+        for key in ("cv_id", "model_version", "total", "items"):
+            assert second[key] == first[key]
+
+    def test_cache_refreshes_when_job_content_changes(
+        self, db_session, seeded_taxonomy, monkeypatch
+    ):
+        """Perubahan konten job (updated_at naik) → payload cache diperbarui:
+        judul baru muncul di rekomendasi berikutnya."""
+        import time as time_module
+        from datetime import UTC, datetime
+
+        monkeypatch.setattr(embedding_service, "get_embedder", _fake_factory)
+        user, cv, hr, company = _seed_world(
+            db_session, "rec-dbcache-upd@example.dev", "rec-hr12@example.dev"
+        )
+        job = _seed_rec_job(db_session, hr, company, skills=SKILLS_FULL)
+        settings = _svc_settings()
+        first = recommendation_service.recommend_jobs(db_session, user, settings)
+        assert first["items"][0]["title"] == "Data Analyst Senior"
+
+        time_module.sleep(1.05)  # presisi detik SQLite: updated_at harus berubah
+        job.title = "Senior Analytics Lead"
+        job.updated_at = datetime.now(UTC)
+        db_session.commit()
+
+        second = recommendation_service.recommend_jobs(db_session, user, settings)
+        titles = [item["title"] for item in second["items"]]
+        assert "Senior Analytics Lead" in titles
+        assert "Data Analyst Senior" not in titles
+
+    def test_closed_job_excluded_with_warm_cache(self, db_session, seeded_taxonomy, monkeypatch):
+        """Job ditutup → hilang dari metadata aktif (filter di evaluasi ulang tiap
+        request) → tidak muncul walau cache payload masih menyimpannya."""
+        import time as time_module
+        from datetime import UTC, datetime
+
+        monkeypatch.setattr(embedding_service, "get_embedder", _fake_factory)
+        user, cv, hr, company = _seed_world(
+            db_session, "rec-dbcache-close@example.dev", "rec-hr13@example.dev"
+        )
+        job = _seed_rec_job(db_session, hr, company, skills=SKILLS_FULL)
+        settings = _svc_settings()
+        first = recommendation_service.recommend_jobs(db_session, user, settings)
+        assert first["total"] == 1
+
+        time_module.sleep(1.05)
+        job.status = "closed"
+        job.updated_at = datetime.now(UTC)
+        db_session.commit()
+
+        second = recommendation_service.recommend_jobs(db_session, user, settings)
+        assert second["total"] == 0
+        assert second["items"] == []
+
+    def test_cache_refreshes_when_vector_re_embedded(
+        self, db_session, seeded_taxonomy, monkeypatch
+    ):
+        """Re-embed (updated_at embedding naik) → vektor cache diperbarui:
+        request berikutnya memakai vektor BARU, bukan yang lama."""
+        import time as time_module
+
+        monkeypatch.setattr(embedding_service, "get_embedder", _fake_factory)
+        user, cv, hr, company = _seed_world(
+            db_session, "rec-dbcache-vec@example.dev", "rec-hr14@example.dev"
+        )
+        job = _seed_rec_job(db_session, hr, company, skills=SKILLS_FULL)
+        settings = _svc_settings()
+        recommendation_service.recommend_jobs(db_session, user, settings)
+
+        old_vector = recommendation_service._JOB_VECTOR_CACHE[job.id][1]
+
+        # Re-embed dengan konten berubah → vektor baru (embedder palsu
+        # deterministik per teks → konten beda menghasilkan vektor beda).
+        time_module.sleep(1.05)
+        job.skills = [{"name": "React", "required": True}, {"name": "Docker", "required": True}]
+        db_session.commit()
+        embedding_service.embed_job(db_session, job.id, settings)
+
+        recommendation_service.recommend_jobs(db_session, user, settings)
+        new_vector = recommendation_service._JOB_VECTOR_CACHE[job.id][1]
+        assert new_vector != old_vector
+        assert len(new_vector) == len(old_vector)  # dimensi sama (384)
+
+
+# =====================================================================
+# 5. Prime cache saat startup (incident tes manual 22 Nov: cold > 20 dtk)
+# =====================================================================
+
+
+class TestPrimeCaches:
+    def test_prime_caches_fills_all_and_second_sync_is_noop(
+        self, db_session, seeded_taxonomy, monkeypatch
+    ):
+        """prime_caches mengisi seluruh cache user-independent (payload job,
+        vektor, encode judul, memo skill); sinkronisasi kedua tanpa fetch berat;
+        request pertama setelah prime = hasil identik dengan tanpa prime."""
+        import sqlalchemy as sa
+
+        # TextEmbedder ASLI (jalur cache encode nyata) dengan model chunk palsu.
+        from tests.test_embedding import FakeChunkModel
+
+        embedder = embedder_module.TextEmbedder(MODEL_NAME)
+        monkeypatch.setattr(embedder, "_load_model", lambda: FakeChunkModel())
+        monkeypatch.setattr(embedding_service, "get_embedder", lambda _model: embedder)
+        from app.services import recommendation_service as rs
+
+        user, cv, hr, company = _seed_world(
+            db_session, "rec-prime@example.dev", "rec-hr15@example.dev"
+        )
+        _seed_rec_job(db_session, hr, company, skills=SKILLS_FULL)
+        _seed_rec_job(db_session, hr, company, skills=SKILLS_PARTIAL)
+        settings = _svc_settings()
+
+        stats = rs.prime_caches(db_session, settings)
+        assert stats["jobs"] == 2
+        assert stats["vectors"] == 2
+        assert stats["titles_encoded"] == 2
+        assert stats["embedded_on_the_fly"] == 2  # vektor belum ada saat prime
+        assert len(rs._JOB_DATA_CACHE) == 2
+        assert len(rs._JOB_VECTOR_CACHE) == 2
+        # encode judul ter-cache: request berikutnya tanpa panggilan model
+        cached_titles = {key[1] for key in embedder_module._ENCODE_CACHE}
+        assert "Data Analyst Senior" in cached_titles
+
+        # Sinkronisasi kedua (katalog tidak berubah) → TANPA fetch berat.
+        log: list[str] = []
+
+        def _record(conn, cursor, stmt, params, many, extra):
+            log.append(" ".join(stmt.split()))
+
+        sa.event.listen(db_session.get_bind(), "before_cursor_execute", _record)
+        try:
+            stats2 = rs.prime_caches(db_session, settings)
+        finally:
+            sa.event.remove(db_session.get_bind(), "before_cursor_execute", _record)
+        assert stats2["jobs_fetched"] == 0
+        assert stats2["vectors_fetched"] == 0
+
+        # Request pertama setelah prime = hasil identik dengan alur lama.
+        result = recommendation_service.recommend_jobs(db_session, user, settings)
+        assert result["total"] == 2
+        assert [item["title"] for item in result["items"]] == [
+            "Data Analyst Senior",
+            "Data Analyst Senior",
+        ]

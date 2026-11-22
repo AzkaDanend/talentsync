@@ -9,6 +9,7 @@ Kontrak untuk normalizer/ekstraksi (M3, agen berikutnya):
 """
 
 import json
+import uuid
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -103,6 +104,7 @@ def seed_from_json(db: Session, json_path: Path | None = None) -> dict:
             existing_aliases.add(alias_text)
 
     db.commit()
+    reset_alias_index_cache()  # taksonomi berubah → indeks cache tidak valid
     return {
         "canonical": int(db.scalar(select(func.count()).select_from(CanonicalSkill))),
         "aliases": int(db.scalar(select(func.count()).select_from(SkillAlias))),
@@ -115,18 +117,62 @@ def load_alias_index(db: Session) -> dict[str, CanonicalSkill]:
 
     Satu query (outerjoin); hanya skill aktif. Dipakai normalizer M3 dan
     autocomplete — nama kanon selalu menang atas alias bila bertabrakan.
+
+    Di-cache per proses: incident 21 Nov 2026 — jalur rekomendasi memanggil ini
+    sekali per lowongan (dan normalize_skill sekali per NAMA SKILL), sehingga
+    satu request membayar ratusan query × 1-4 dtk melalui pooler (latensi
+    menit-an per request). Taksonomi hanya berubah lewat seed_from_json
+    (invalidasi di sana) dan reset_alias_index_cache() untuk test.
     """
+    global _ALIAS_INDEX_CACHE
+    if _ALIAS_INDEX_CACHE is not None:
+        return _ALIAS_INDEX_CACHE
     rows = db.execute(
         select(CanonicalSkill, SkillAlias)
         .outerjoin(SkillAlias, SkillAlias.canonical_skill_id == CanonicalSkill.id)
         .where(CanonicalSkill.is_active.is_(True))
     ).all()
     index: dict[str, CanonicalSkill] = {}
+    cached: set[uuid.UUID] = set()
     for skill, alias in rows:
+        if skill.id not in cached:
+            cached.add(skill.id)
+            # Detach dari session peminta SEBELUM masuk cache: objek yang tetap
+            # attached akan DI-EXPIRE oleh rollback session tsb. (mis. jalur
+            # gagal embed di recommend_jobs), meracuni cache proses — request
+            # berikutnya kena DetachedInstanceError saat membaca .slug/.name.
+            db.expunge(skill)
         index[skill.name.strip().lower()] = skill
         if alias is not None:
             index.setdefault(alias.alias.strip().lower(), skill)
+    _ALIAS_INDEX_CACHE = index
     return index
+
+
+_ALIAS_INDEX_CACHE: dict[str, CanonicalSkill] | None = None
+
+# Split lookup (names/aliases) untuk _ALIAS_INDEX_CACHE — hasil _split_lookup
+# O(jumlah entri) yang dulu dijalankan ULANG pada SETIAP normalize_skill.
+_SPLIT_CACHE: tuple[dict[str, CanonicalSkill], dict[str, CanonicalSkill]] | None = None
+
+# Memo keputusan normalisasi per (query, fuzzy_threshold). NILAI MURNI DATA
+# (str/float/bool/tuple) — tanpa objek ORM: keputusan fuzzy (SequenceMatcher
+# ~954 entri per nama tanpa padanan exact/alias) dihitung SEKALI per nama unik;
+# objek kanon direkonstruksi dari indeks alias yang sudah bebas-sesi.
+# Incident 21 Nov 2026: tahap resolve skill rekomendasi 103 dtk CPU murni
+# karena fuzzy matching berulang untuk nama skill yang sama antar lowongan.
+_NORMALIZE_CACHE: dict[tuple[str, float], tuple] = {}
+
+
+def reset_alias_index_cache() -> None:
+    """Kosongkan seluruh cache taksonomi proses (test & CLI/scripts).
+
+    Satu pintu invalidasi: indeks alias, split lookup, dan memo normalisasi —
+    seed_from_json memanggil ini saat taksonomi berubah."""
+    global _ALIAS_INDEX_CACHE, _SPLIT_CACHE, _NORMALIZE_CACHE
+    _ALIAS_INDEX_CACHE = None
+    _SPLIT_CACHE = None
+    _NORMALIZE_CACHE.clear()
 
 
 def _split_lookup(index: dict[str, CanonicalSkill]) -> tuple[dict, dict]:
@@ -142,11 +188,69 @@ def _split_lookup(index: dict[str, CanonicalSkill]) -> tuple[dict, dict]:
     return names, aliases
 
 
-def normalize_skill(db: Session, raw: str, *, fuzzy_threshold: float = 0.92) -> dict:
+def _get_split(index: dict[str, CanonicalSkill]) -> tuple[dict, dict]:
+    """_split_lookup dengan cache proses — HANYA untuk indeks cache proses.
+
+    _split_lookup O(entri) dan dulu dijalankan ulang per panggilan normalize_skill
+    (954× normalize_text per nama skill — kontributor latensi tahap resolve).
+    Indeks milik pemanggil (bukan cache proses) selalu dihitung segar: isinya
+    bisa apa saja (test/CLI), memo tidak boleh mengasosiasinya dengan keputusan
+    yang di-cache."""
+    global _SPLIT_CACHE
+    if index is _ALIAS_INDEX_CACHE and _SPLIT_CACHE is not None:
+        return _SPLIT_CACHE
+    names, aliases = _split_lookup(index)
+    if index is _ALIAS_INDEX_CACHE:
+        _SPLIT_CACHE = (names, aliases)
+    return names, aliases
+
+
+def _normalize_from_decision(
+    decision: tuple, names: dict[str, CanonicalSkill], aliases: dict[str, CanonicalSkill]
+) -> dict:
+    """Bangun hasil normalize_skill dari keputusan ter-memo (nilai murni data).
+
+    Objek kanon diambil dari indeks alias yang sudah bebas-sesi (expunge saat
+    cache dibangun) — memo TIDAK menyimpan objek ORM agar rollback session
+    mana pun tidak bisa meracuninya."""
+    method, matched_nk, confidence, needs_review, suggestions = decision
+    if method == "none":
+        canonical = None
+    elif method == "exact":
+        canonical = names.get(matched_nk)
+    elif method == "alias":
+        canonical = aliases.get(matched_nk)
+    else:  # fuzzy — pemenang adalah kunci dinormalisasi pada gabungan (kanon menang)
+        canonical = {**aliases, **names}.get(matched_nk)
+    return {
+        "canonical": canonical,
+        "confidence": confidence,
+        "method": method,
+        "needs_review": needs_review,
+        # salinan segar per panggilan: pemanggil bebas memutasi hasilnya tanpa
+        # mengubah keputusan yang di-cache.
+        "suggestions": [dict(item) for item in suggestions],
+    }
+
+
+def normalize_skill(
+    db: Session, raw: str, *, fuzzy_threshold: float = 0.92, index: dict | None = None
+) -> dict:
     """Normalisasi satu nama skill mentah ke skill kanon (dictionary-first).
 
     Urutan: exact nama kanon (0.95) -> alias (0.95) -> fuzzy unik (0.8) ->
     gagal (needs_review + saran). Tidak pernah memaksa pemetaan ambigu.
+
+    `index` opsional: peta alias yang sudah dimuat pemanggil (sekali untuk
+    banyak nama — tanpa ini setiap nama memicu query indeks baru; incident
+    21 Nov 2026). Bila None, indeks dimuat (cache per proses).
+
+    Memo per proses: keputusan (exact/alias/fuzzy/none + saran) di-cache per
+    (query, fuzzy_threshold) untuk indeks cache proses — fuzzy SequenceMatcher
+    (~954 entri) dulu dijalankan ulang untuk SETIAP kemunculan nama yang sama
+    antar lowongan (tahap resolve skill rekomendasi 103 dtk CPU). Hasil fungsi
+    IDENTIK dengan tanpa memo: keputusan murni fungsi dari (query, indeks,
+    threshold), objek kanon direkonstruksi dari indeks yang sama.
 
     Bentuk saran: [{"slug": ..., "name": ..., "score": ...}] (maks 3, score >= 0.8).
     """
@@ -160,10 +264,21 @@ def normalize_skill(db: Session, raw: str, *, fuzzy_threshold: float = 0.92) -> 
             "suggestions": [],
         }
 
-    names, aliases = _split_lookup(load_alias_index(db))
+    resolved_index = index if index is not None else load_alias_index(db)
+    names, aliases = _get_split(resolved_index)
+    # Memo hanya untuk indeks cache proses (identitas sama) — keputusan adalah
+    # fungsi murni dari (query, isi indeks, threshold).
+    use_memo = resolved_index is _ALIAS_INDEX_CACHE
+    memo_key = (query, fuzzy_threshold)
+    if use_memo:
+        cached_decision = _NORMALIZE_CACHE.get(memo_key)
+        if cached_decision is not None:
+            return _normalize_from_decision(cached_decision, names, aliases)
 
     hit = names.get(query)
     if hit is not None:
+        if use_memo:
+            _NORMALIZE_CACHE[memo_key] = ("exact", query, _CONFIDENCE_EXACT, False, ())
         return {
             "canonical": hit,
             "confidence": _CONFIDENCE_EXACT,
@@ -173,6 +288,8 @@ def normalize_skill(db: Session, raw: str, *, fuzzy_threshold: float = 0.92) -> 
         }
     hit = aliases.get(query)
     if hit is not None:
+        if use_memo:
+            _NORMALIZE_CACHE[memo_key] = ("alias", query, _CONFIDENCE_ALIAS, False, ())
         return {
             "canonical": hit,
             "confidence": _CONFIDENCE_ALIAS,
@@ -184,16 +301,21 @@ def normalize_skill(db: Session, raw: str, *, fuzzy_threshold: float = 0.92) -> 
     # Fuzzy terkendali: nilai terbaik PER skill (satu skill bisa punya beberapa
     # alias dengan skor mirip — tidak dihitung sebagai kompetitor).
     per_skill: dict[object, tuple[float, CanonicalSkill]] = {}
+    best_nk: dict[object, str] = {}
     for nk, skill in {**aliases, **names}.items():
         ratio = SequenceMatcher(None, query, nk).ratio()
         current = per_skill.get(skill.id)
         if current is None or ratio > current[0]:
             per_skill[skill.id] = (ratio, skill)
+            best_nk[skill.id] = nk
     ranked = sorted(per_skill.values(), key=lambda item: item[0], reverse=True)
 
     best_ratio, best_skill = ranked[0]
     second_ratio = ranked[1][0] if len(ranked) > 1 else 0.0
     if best_ratio >= fuzzy_threshold and second_ratio < best_ratio - FUZZY_MARGIN:
+        if use_memo:
+            decision = ("fuzzy", best_nk[best_skill.id], _CONFIDENCE_FUZZY, False, ())
+            _NORMALIZE_CACHE[memo_key] = decision
         return {
             "canonical": best_skill,
             "confidence": _CONFIDENCE_FUZZY,
@@ -207,6 +329,8 @@ def normalize_skill(db: Session, raw: str, *, fuzzy_threshold: float = 0.92) -> 
         for ratio, skill in ranked[:3]
         if ratio >= FUZZY_SUGGEST_MIN
     ]
+    if use_memo:
+        _NORMALIZE_CACHE[memo_key] = ("none", None, 0.0, True, tuple(suggestions))
     return {
         "canonical": None,
         "confidence": 0.0,
@@ -226,7 +350,7 @@ def autocomplete(db: Session, q: str, limit: int = 10) -> list[CanonicalSkill]:
     if len(query) < 2:
         return []
 
-    names, aliases = _split_lookup(load_alias_index(db))
+    names, aliases = _get_split(load_alias_index(db))
     nq = normalize_text(query)
 
     ranked: dict[object, tuple[int, CanonicalSkill]] = {}

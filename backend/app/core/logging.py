@@ -36,7 +36,15 @@ def configure_logging(level: str = "INFO") -> None:
     root.setLevel(level.upper())
 
     # Uvicorn punya handler sendiri; matikan agar output tidak dobel
-    # dan mengalir lewat formatter JSON yang sama.
+    # dan mengalir lewat formatter JSON yang sama. Access line uvicorn
+    # TIDAK dipakai (tanpa request ID & durasi) — RequestIdMiddleware
+    # (main.py) memancarkan access line yang lebih kaya.
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        logging.getLogger(name).handlers = []
-        logging.getLogger(name).propagate = True
+        logger_uvicorn = logging.getLogger(name)
+        logger_uvicorn.handlers = []
+        logger_uvicorn.propagate = name != "uvicorn.access"
+
+    # HTTP client libraries mencatat setiap request eksternal di INFO —
+    # duplikat dengan log panggilan Groq yang sudah berdurasi; bungkam.
+    for name in ("httpx", "httpcore", "httpx2"):
+        logging.getLogger(name).setLevel(logging.WARNING)

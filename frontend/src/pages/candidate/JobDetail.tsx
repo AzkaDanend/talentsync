@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import axios from "axios";
 import {
   applyToJob,
@@ -53,6 +53,11 @@ function StatusChip({ status }: { status: MyApplicationRow["status"] }) {
 export default function JobDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
+  // Dibuka dari daftar rekomendasi? → tombol kembali mengarah ke rekomendasi,
+  // bukan ke pencarian (navigasi rekomendasi → detail → kembali mulus).
+  const fromRecommendations =
+    (location.state as { from?: string } | null)?.from === "recommendations";
   const [job, setJob] = useState<Job | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -165,9 +170,15 @@ export default function JobDetailPage() {
 
   return (
     <div className="space-y-5">
-      <Link to="/app/jobs" className="text-sm font-medium text-primary-700">
-        ← Kembali ke daftar lowongan
-      </Link>
+      {fromRecommendations ? (
+        <Link to="/app/recommendations" className="text-sm font-medium text-primary-700">
+          ← Kembali ke rekomendasi
+        </Link>
+      ) : (
+        <Link to="/app/jobs" className="text-sm font-medium text-primary-700">
+          ← Kembali ke daftar lowongan
+        </Link>
+      )}
 
       <Card>
         <div className="flex flex-wrap items-start justify-between gap-4">

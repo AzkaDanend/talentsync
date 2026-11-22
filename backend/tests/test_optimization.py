@@ -18,7 +18,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.optimization.grounding_validator import ensure_suggestion_ids, validate_edits
-from app.ai.optimization.llm_client import GroqClient, LLMError, build_client
+from app.ai.optimization.llm_client import (
+    GroqClient,
+    LLMError,
+    build_client,
+    reset_schema_rejection_memory,
+)
 from app.ai.optimization.pdf_renderer import render_cv_pdf
 from app.ai.optimization.prompts import PROMPT_VERSION, build_messages
 from app.core.config import Settings
@@ -35,6 +40,15 @@ from tests.test_extraction_api import CV_LINES, get_extraction, make_multiline_p
 FAKE_KEY = "test-groq-key-fake"
 PRIMARY_MODEL = "test-model-utama"
 FALLBACK_MODEL = "test-model-cadangan"
+
+
+@pytest.fixture(autouse=True)
+def _reset_schema_memory():
+    """Memori penolakan json_schema per-model dibersihkan antar test — perilaku
+    klien harus independen antar test (proses produksi justru mengingatnya)."""
+    reset_schema_rejection_memory()
+    yield
+    reset_schema_rejection_memory()
 
 
 def _opt_settings(**overrides) -> Settings:
@@ -284,6 +298,31 @@ class TestGroqClient:
         assert client.last_model == PRIMARY_MODEL
         assert len(requests) == 2
         assert json.loads(requests[1].read())["response_format"] == {"type": "json_object"}
+
+    def test_schema_rejection_is_remembered_next_call_skips_400(self):
+        """Incident 21 Nov 2026: json_schema ditolak provider (400) lalu
+        json_object berhasil (200). Panggilan BERIKUTNYA pada proses yang sama
+        harus langsung json_object — tanpa round-trip 400 berbayang (latensi)."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.read())
+            if body["response_format"]["type"] == "json_schema":
+                return httpx.Response(400, json={"error": {"message": "schema rejected"}})
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": json.dumps({"edits": []})}}]}
+            )
+
+        client, requests = _unit_client(handler)
+        first = client.generate_optimizations("system", "user")
+        assert first == {"edits": []}
+        assert len(requests) == 2  # 400 (schema) → 200 (json_object)
+
+        requests.clear()
+        second = client.generate_optimizations("system", "user")
+        assert second == {"edits": []}
+        # Panggilan kedua langsung json_object: TIDAK ada 400 yang diulang.
+        assert len(requests) == 1
+        assert json.loads(requests[0].read())["response_format"] == {"type": "json_object"}
 
     def test_429_retries_once_then_falls_back_to_fallback_model(self):
         sleeps: list[float] = []

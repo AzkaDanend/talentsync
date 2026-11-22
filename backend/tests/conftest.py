@@ -25,6 +25,43 @@ from app.main import create_app
 TEST_DATABASE_URL = os.environ.get("DATABASE_URL_TEST")
 
 
+@pytest.fixture(autouse=True)
+def _reset_alias_index_cache():
+    """Cache indeks alias taksonomi (per proses) harus dingin di awal SETIAP test:
+    setiap test memakai database sendiri, jadi indeks dari test sebelumnya tidak
+    valid. Di produksi cache tetap hidup (satu DB per proses)."""
+    from app.services import taxonomy_service
+
+    taxonomy_service.reset_alias_index_cache()
+    yield
+    taxonomy_service.reset_alias_index_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_encode_cache():
+    """Cache hasil encode (per proses, kunci (model_name, teks)) harus dingin per
+    test: test mengganti model palsu dengan model_name yang SAMA — tanpa reset,
+    vektor dari model palsu test sebelumnya bocor ke test berikutnya. Di produksi
+    model_name ↔ bobot model 1:1 sehingga cache tetap hidup dan aman."""
+    from app.ai.matching import embedder
+
+    embedder.reset_encode_cache()
+    yield
+    embedder.reset_encode_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_recommendation_cache():
+    """Cache payload/vektor rekomendasi (per proses) harus dingin per test:
+    setiap test memakai database sendiri. Di produksi kesegaran dijaga lewat
+    updated_at otoritatif-DB; di sini tiap test mulai dari keadaan dingin."""
+    from app.services import recommendation_service
+
+    recommendation_service.reset_recommendation_cache()
+    yield
+    recommendation_service.reset_recommendation_cache()
+
+
 @pytest.fixture()
 def db_engine() -> Generator:
     if TEST_DATABASE_URL:
